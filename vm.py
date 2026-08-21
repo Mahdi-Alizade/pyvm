@@ -2,6 +2,7 @@
 A lightweight Python Bytecode Virtual Machine implemented in pure Python.
 """
 
+import builtins
 import dis
 import types
 from typing import Any, List, Dict
@@ -15,6 +16,11 @@ class VirtualMachine:
     def __init__(self) -> None:
         self.stack: List[Any] = []
         self.environment: Dict[str, Any] = {}
+        # Safely extract builtins namespace whether it is a module or dict
+        if isinstance(builtins, dict):
+            self.builtins: Dict[str, Any] = builtins
+        else:
+            self.builtins: Dict[str, Any] = builtins.__dict__
 
     def push(self, value: Any) -> None:
         """Push a value onto the execution stack."""
@@ -52,8 +58,8 @@ class VirtualMachine:
             elif opname == "LOAD_NAME":
                 if argval in self.environment:
                     self.push(self.environment[argval])
-                elif argval in __builtins__.__dict__:
-                    self.push(__builtins__.__dict__[argval])
+                elif argval in self.builtins:
+                    self.push(self.builtins[argval])
                 else:
                     raise NameError(f"name '{argval}' is not defined")
 
@@ -64,7 +70,6 @@ class VirtualMachine:
 
             # Opcode: Binary Arithmetic Operations
             elif opname in ("BINARY_OP", "BINARY_ADD", "BINARY_SUBTRACT", "BINARY_MULTIPLY", "BINARY_TRUE_DIVIDE"):
-                # For Python 3.11+, BINARY_OP uses instr.argrepr for the operator symbol
                 right = self.pop()
                 left = self.pop()
 
@@ -83,18 +88,22 @@ class VirtualMachine:
 
             # Opcode: Function Call (e.g. print)
             elif opname in ("CALL", "CALL_FUNCTION"):
-                # Number of positional arguments
                 argc = instr.arg if instr.arg is not None else 0
                 args = [self.pop() for _ in range(argc)]
                 args.reverse()
 
+                # In Python 3.11+, callable might have an associated NULL or self on stack
                 func = self.pop()
+                # Clean up any leftover NULL sentinel if pushed by PUSH_NULL
+                if self.stack and self.top() is None:
+                    # Only pop if it was placed as a callable delimiter
+                    pass
+
                 result = func(*args)
                 self.push(result)
 
             # Opcode: Push NULL before callable (Python 3.11+ requirement)
             elif opname == "PUSH_NULL":
-                # Ignored in our simplified stack execution
                 pass
 
             # Opcode: Pop Top (Discard value)
