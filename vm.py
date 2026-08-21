@@ -38,6 +38,33 @@ class VirtualMachine:
             raise IndexError("peek from empty execution stack")
         return self.stack[-1]
 
+    def _eval_compare(self, left: Any, right: Any, raw_op: str) -> bool:
+        """Evaluate comparison operation cleanly across different Python version dis formats."""
+        op = raw_op.replace("bool(", "").replace(")", "").strip()
+
+        if op == "==":
+            return left == right
+        elif op == "!=":
+            return left != right
+        elif op == "<":
+            return left < right
+        elif op == "<=":
+            return left <= right
+        elif op == ">":
+            return left > right
+        elif op == ">=":
+            return left >= right
+        elif op in ("in", "IN"):
+            return left in right
+        elif op in ("not in", "NOT_IN"):
+            return left not in right
+        elif op in ("is", "IS"):
+            return left is right
+        elif op in ("is not", "IS_NOT"):
+            return left is not right
+        else:
+            raise NotImplementedError(f"Unsupported comparison symbol: '{raw_op}' (parsed as '{op}')")
+
     def run_code(self, code_obj: types.CodeType) -> Any:
         """
         Disassemble and execute a Python code object instruction by instruction.
@@ -97,26 +124,12 @@ class VirtualMachine:
                 else:
                     raise NotImplementedError(f"Unsupported binary operator: {instr.argrepr}")
 
-            # Opcode: Comparison Operations (==, !=, <, <=, >, >=)
+            # Opcode: Comparison Operations
             elif opname == "COMPARE_OP":
                 right = self.pop()
                 left = self.pop()
-                symbol = instr.argrepr.strip()
-
-                if symbol == "==":
-                    self.push(left == right)
-                elif symbol == "!=":
-                    self.push(left != right)
-                elif symbol == "<":
-                    self.push(left < right)
-                elif symbol == "<=":
-                    self.push(left <= right)
-                elif symbol == ">":
-                    self.push(left > right)
-                elif symbol == ">=":
-                    self.push(left >= right)
-                else:
-                    raise NotImplementedError(f"Unsupported comparison symbol: {symbol}")
+                result = self._eval_compare(left, right, instr.argrepr)
+                self.push(result)
 
             # Opcode: Unconditional Jumps
             elif opname in ("JUMP_FORWARD", "JUMP_BACKWARD", "JUMP_ABSOLUTE"):
