@@ -43,12 +43,16 @@ class VirtualMachine:
         Disassemble and execute a Python code object instruction by instruction.
         """
         instructions = list(dis.get_instructions(code_obj))
+        # Build map from instruction offset to index in list for accurate jump branching
+        offset_to_index = {instr.offset: idx for idx, instr in enumerate(instructions)}
+
         instruction_pointer = 0
 
         while instruction_pointer < len(instructions):
             instr = instructions[instruction_pointer]
             opname = instr.opname
             argval = instr.argval
+            jump_taken = False
 
             # Opcode: Load Constant
             if opname == "LOAD_CONST":
@@ -86,19 +90,55 @@ class VirtualMachine:
                 else:
                     raise NotImplementedError(f"Unsupported binary operator: {instr.argrepr}")
 
-            # Opcode: Function Call (e.g. print)
+            # Opcode: Comparison Operations (==, !=, <, <=, >, >=)
+            elif opname == "COMPARE_OP":
+                right = self.pop()
+                left = self.pop()
+                symbol = instr.argrepr.strip()
+
+                if symbol == "==":
+                    self.push(left == right)
+                elif symbol == "!=":
+                    self.push(left != right)
+                elif symbol == "<":
+                    self.push(left < right)
+                elif symbol == "<=":
+                    self.push(left <= right)
+                elif symbol == ">":
+                    self.push(left > right)
+                elif symbol == ">=":
+                    self.push(left >= right)
+                else:
+                    raise NotImplementedError(f"Unsupported comparison symbol: {symbol}")
+
+            # Opcode: Unconditional Jumps
+            elif opname in ("JUMP_FORWARD", "JUMP_BACKWARD", "JUMP_ABSOLUTE"):
+                target_offset = instr.argval
+                instruction_pointer = offset_to_index[target_offset]
+                jump_taken = True
+
+            # Opcode: Conditional Jumps (Python 3.10 / 3.11 / 3.12+ variants)
+            elif opname in ("POP_JUMP_IF_FALSE", "POP_JUMP_FORWARD_IF_FALSE", "POP_JUMP_BACKWARD_IF_FALSE"):
+                val = self.pop()
+                if not bool(val):
+                    target_offset = instr.argval
+                    instruction_pointer = offset_to_index[target_offset]
+                    jump_taken = True
+
+            elif opname in ("POP_JUMP_IF_TRUE", "POP_JUMP_FORWARD_IF_TRUE", "POP_JUMP_BACKWARD_IF_TRUE"):
+                val = self.pop()
+                if bool(val):
+                    target_offset = instr.argval
+                    instruction_pointer = offset_to_index[target_offset]
+                    jump_taken = True
+
+            # Opcode: Function Call
             elif opname in ("CALL", "CALL_FUNCTION"):
                 argc = instr.arg if instr.arg is not None else 0
                 args = [self.pop() for _ in range(argc)]
                 args.reverse()
 
-                # In Python 3.11+, callable might have an associated NULL or self on stack
                 func = self.pop()
-                # Clean up any leftover NULL sentinel if pushed by PUSH_NULL
-                if self.stack and self.top() is None:
-                    # Only pop if it was placed as a callable delimiter
-                    pass
-
                 result = func(*args)
                 self.push(result)
 
@@ -111,17 +151,22 @@ class VirtualMachine:
                 if self.stack:
                     self.pop()
 
+            # Opcode: Return Constant (Python 3.12+ optimization)
+            elif opname == "RETURN_CONST":
+                return argval
+
             # Opcode: Return Value
             elif opname == "RETURN_VALUE":
                 return self.pop() if self.stack else None
 
-            # Opcode: Resume (No-op in 3.11+)
+            # Opcode: Resume and administrative opcodes
             elif opname in ("RESUME", "NOP", "PRECALL"):
                 pass
 
             else:
                 raise NotImplementedError(f"Opcode '{opname}' is not yet supported in this VM.")
 
-            instruction_pointer += 1
+            if not jump_taken:
+                instruction_pointer += 1
 
         return None
