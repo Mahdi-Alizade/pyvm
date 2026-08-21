@@ -5,7 +5,25 @@ A lightweight Python Bytecode Virtual Machine implemented in pure Python.
 import builtins
 import dis
 import types
-from typing import Any, List, Dict
+from typing import Any, List, Dict, Optional
+
+
+class Function:
+    """Represents a user-defined function inside the custom Virtual Machine."""
+
+    def __init__(self, code_obj: types.CodeType, vm: "VirtualMachine", name: Optional[str] = None) -> None:
+        self.code_obj = code_obj
+        self.vm = vm
+        self.name = name or code_obj.co_name
+
+    def __call__(self, *args: Any) -> Any:
+        # Bind incoming arguments to local variable names defined in code_obj
+        local_env: Dict[str, Any] = {}
+        for var_name, arg_val in zip(self.code_obj.co_varnames, args):
+            local_env[var_name] = arg_val
+
+        # Execute function body in its own isolated frame
+        return self.vm.run_code(self.code_obj, local_env=local_env)
 
 
 class VirtualMachine:
@@ -15,7 +33,7 @@ class VirtualMachine:
 
     def __init__(self) -> None:
         self.stack: List[Any] = []
-        self.environment: Dict[str, Any] = {}
+        self.globals: Dict[str, Any] = {}
         # Safely extract builtins namespace whether it is a module or dict
         if isinstance(builtins, dict):
             self.builtins: Dict[str, Any] = builtins
@@ -65,12 +83,12 @@ class VirtualMachine:
         else:
             raise NotImplementedError(f"Unsupported comparison symbol: '{raw_op}' (parsed as '{op}')")
 
-    def run_code(self, code_obj: types.CodeType) -> Any:
+    def run_code(self, code_obj: types.CodeType, local_env: Optional[Dict[str, Any]] = None) -> Any:
         """
         Disassemble and execute a Python code object instruction by instruction.
         """
+        locals_scope = local_env if local_env is not None else self.globals
         instructions = list(dis.get_instructions(code_obj))
-        # Build map from instruction offset to index in list for accurate jump branching
         offset_to_index = {instr.offset: idx for idx, instr in enumerate(instructions)}
 
         instruction_pointer = 0
@@ -85,30 +103,55 @@ class VirtualMachine:
             if opname == "LOAD_CONST":
                 self.push(argval)
 
-            # Opcode: Load Variable (Global/Name)
-            elif opname in ("LOAD_NAME", "LOAD_GLOBAL"):
-                if argval in self.environment:
-                    self.push(self.environment[argval])
+            # Opcode: Load Global / Builtin Variable
+            elif opname == "LOAD_GLOBAL":
+                if argval in self.globals:
+                    self.push(self.globals[argval])
+                elif argval in self.builtins:
+                    self.push(self.builtins[argval])
+                else:
+                    raise NameError(f"global name '{argval}' is not defined")
+
+            elif opname == "STORE_GLOBAL":
+                val = self.pop()
+                self.globals[argval] = val
+
+            # Opcode: Load / Store Name (Module-level Scope)
+            elif opname == "LOAD_NAME":
+                if argval in locals_scope:
+                    self.push(locals_scope[argval])
+                elif argval in self.globals:
+                    self.push(self.globals[argval])
                 elif argval in self.builtins:
                     self.push(self.builtins[argval])
                 else:
                     raise NameError(f"name '{argval}' is not defined")
 
-            # Opcode: Store Variable (Global/Name)
-            elif opname in ("STORE_NAME", "STORE_GLOBAL"):
+            elif opname == "STORE_NAME":
                 val = self.pop()
-                self.environment[argval] = val
+                locals_scope[argval] = val
 
-            # Opcode: Fast Local Variable Access
+            # Opcode: Fast Local Variable Access (Function Scope)
             elif opname == "LOAD_FAST":
-                if argval in self.environment:
-                    self.push(self.environment[argval])
+                if argval in locals_scope:
+                    self.push(locals_scope[argval])
+                elif argval in self.globals:
+                    self.push(self.globals[argval])
+                elif argval in self.builtins:
+                    self.push(self.builtins[argval])
                 else:
                     raise UnboundLocalError(f"local variable '{argval}' referenced before assignment")
 
             elif opname == "STORE_FAST":
                 val = self.pop()
-                self.environment[argval] = val
+                locals_scope[argval] = val
+
+            # Opcode: Create Custom Function Object
+            elif opname == "MAKE_FUNCTION":
+                # In modern Python, code object is pushed right before MAKE_FUNCTION
+                code_target = self.pop()
+                func_instance = Function(code_target, self)
+                self.push(func_instance)
 
             # Opcode: Build and Manipulate List
             elif opname == "BUILD_LIST":
@@ -118,7 +161,6 @@ class VirtualMachine:
                 self.push(items)
 
             elif opname == "LIST_EXTEND":
-                # arg is the 1-based index from the top of the stack pointing to the target list
                 i = instr.arg if instr.arg is not None else 1
                 items_to_extend = self.pop()
                 target_list = self.stack[-i]
@@ -187,7 +229,6 @@ class VirtualMachine:
                     next_value = next(iterator)
                     self.push(next_value)
                 except StopIteration:
-                    # Pop the exhausted iterator off the stack
                     self.pop()
                     target_offset = instr.argval
                     instruction_pointer = offset_to_index[target_offset]

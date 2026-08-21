@@ -25,35 +25,29 @@ def run_code_string(source_code: str, title: str = "Test Case") -> None:
 
 
 def main() -> None:
-    # Test 1: Arithmetic and Assignments
-    test_1 = """
-x = 10
-y = 20
-z = x + y
-print("Addition result:", z)
+    # Test 1: Function definition and invocation
+    test_func = """
+def greet(name, age):
+    message = "Hello " + name + "! Next year you will be " + str(age + 1) + "."
+    return message
+
+res = greet("Mahdi", 24)
+print(res)
 """
 
-    # Test 2: If / Else branching
-    test_2 = """
-score = 85
-if score >= 50:
-    print("Status: Passed! Score is", score)
-else:
-    print("Status: Failed.")
+    # Test 2: Recursive Factorial function
+    test_factorial = """
+def factorial(n):
+    if n <= 1:
+        return 1
+    return n * factorial(n - 1)
+
+print("Factorial of 5:", factorial(5))
+print("Factorial of 6:", factorial(6))
 """
 
-    # Test 3: Loop with list summation
-    test_3 = """
-numbers = [1, 2, 3, 4, 5]
-total = 0
-for num in numbers:
-    total = total + num
-print("Sum of numbers in list:", total)
-"""
-
-    run_code_string(test_1, "Arithmetic and Variables")
-    run_code_string(test_2, "Conditional Branching (if/else)")
-    run_code_string(test_3, "List Iteration & For-Loop")
+    run_code_string(test_func, "Function Definition and Call")
+    run_code_string(test_factorial, "Recursive Function Execution (Factorial)")
 
 
 if __name__ == "__main__":
