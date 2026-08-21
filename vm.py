@@ -72,6 +72,13 @@ class VirtualMachine:
                 val = self.pop()
                 self.environment[argval] = val
 
+            # Opcode: Build List
+            elif opname == "BUILD_LIST":
+                count = instr.arg if instr.arg is not None else 0
+                items = [self.pop() for _ in range(count)]
+                items.reverse()
+                self.push(items)
+
             # Opcode: Binary Arithmetic Operations
             elif opname in ("BINARY_OP", "BINARY_ADD", "BINARY_SUBTRACT", "BINARY_MULTIPLY", "BINARY_TRUE_DIVIDE"):
                 right = self.pop()
@@ -117,7 +124,7 @@ class VirtualMachine:
                 instruction_pointer = offset_to_index[target_offset]
                 jump_taken = True
 
-            # Opcode: Conditional Jumps (Python 3.10 / 3.11 / 3.12+ variants)
+            # Opcode: Conditional Jumps
             elif opname in ("POP_JUMP_IF_FALSE", "POP_JUMP_FORWARD_IF_FALSE", "POP_JUMP_BACKWARD_IF_FALSE"):
                 val = self.pop()
                 if not bool(val):
@@ -128,6 +135,23 @@ class VirtualMachine:
             elif opname in ("POP_JUMP_IF_TRUE", "POP_JUMP_FORWARD_IF_TRUE", "POP_JUMP_BACKWARD_IF_TRUE"):
                 val = self.pop()
                 if bool(val):
+                    target_offset = instr.argval
+                    instruction_pointer = offset_to_index[target_offset]
+                    jump_taken = True
+
+            # Opcode: Iterators & For Loops
+            elif opname == "GET_ITER":
+                iterable = self.pop()
+                self.push(iter(iterable))
+
+            elif opname in ("FOR_ITER", "FOR_ITER_GEN"):
+                iterator = self.top()
+                try:
+                    next_value = next(iterator)
+                    self.push(next_value)
+                except StopIteration:
+                    # Pop the exhausted iterator off the stack
+                    self.pop()
                     target_offset = instr.argval
                     instruction_pointer = offset_to_index[target_offset]
                     jump_taken = True
