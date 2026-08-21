@@ -85,8 +85,8 @@ class VirtualMachine:
             if opname == "LOAD_CONST":
                 self.push(argval)
 
-            # Opcode: Load Variable (Name)
-            elif opname == "LOAD_NAME":
+            # Opcode: Load Variable (Global/Name)
+            elif opname in ("LOAD_NAME", "LOAD_GLOBAL"):
                 if argval in self.environment:
                     self.push(self.environment[argval])
                 elif argval in self.builtins:
@@ -94,17 +94,41 @@ class VirtualMachine:
                 else:
                     raise NameError(f"name '{argval}' is not defined")
 
-            # Opcode: Store Variable (Name)
-            elif opname == "STORE_NAME":
+            # Opcode: Store Variable (Global/Name)
+            elif opname in ("STORE_NAME", "STORE_GLOBAL"):
                 val = self.pop()
                 self.environment[argval] = val
 
-            # Opcode: Build List
+            # Opcode: Fast Local Variable Access
+            elif opname == "LOAD_FAST":
+                if argval in self.environment:
+                    self.push(self.environment[argval])
+                else:
+                    raise UnboundLocalError(f"local variable '{argval}' referenced before assignment")
+
+            elif opname == "STORE_FAST":
+                val = self.pop()
+                self.environment[argval] = val
+
+            # Opcode: Build and Manipulate List
             elif opname == "BUILD_LIST":
                 count = instr.arg if instr.arg is not None else 0
                 items = [self.pop() for _ in range(count)]
                 items.reverse()
                 self.push(items)
+
+            elif opname == "LIST_EXTEND":
+                # arg is the 1-based index from the top of the stack pointing to the target list
+                i = instr.arg if instr.arg is not None else 1
+                items_to_extend = self.pop()
+                target_list = self.stack[-i]
+                target_list.extend(items_to_extend)
+
+            elif opname == "LIST_APPEND":
+                i = instr.arg if instr.arg is not None else 1
+                item_to_append = self.pop()
+                target_list = self.stack[-i]
+                target_list.append(item_to_append)
 
             # Opcode: Binary Arithmetic Operations
             elif opname in ("BINARY_OP", "BINARY_ADD", "BINARY_SUBTRACT", "BINARY_MULTIPLY", "BINARY_TRUE_DIVIDE"):
@@ -168,6 +192,10 @@ class VirtualMachine:
                     target_offset = instr.argval
                     instruction_pointer = offset_to_index[target_offset]
                     jump_taken = True
+
+            elif opname == "END_FOR":
+                if self.stack:
+                    self.pop()
 
             # Opcode: Function Call
             elif opname in ("CALL", "CALL_FUNCTION"):
