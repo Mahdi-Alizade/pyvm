@@ -36,7 +36,6 @@ def _parse_exception_table(code_obj: types.CodeType) -> List[ExceptionTableEntry
     if not hasattr(code_obj, "co_exceptiontable") or not code_obj.co_exceptiontable:
         return []
 
-    # Use dis._parse_exception_table if available (standard CPython implementation)
     if hasattr(dis, "_parse_exception_table"):
         try:
             raw_entries = dis._parse_exception_table(code_obj.co_exceptiontable)
@@ -47,7 +46,6 @@ def _parse_exception_table(code_obj: types.CodeType) -> List[ExceptionTableEntry
         except Exception:
             pass
 
-    # Standard fallback parser matching CPython's internal variable-length encoding
     raw = code_obj.co_exceptiontable
     iterator = iter(raw)
     entries: List[ExceptionTableEntry] = []
@@ -249,7 +247,6 @@ class VirtualMachine:
         matching_entry: Optional[ExceptionTableEntry] = None
 
         for entry in frame.exception_entries:
-            # Check both byte-offset and instruction-index ranges for version compatibility
             if entry.start <= current_offset < entry.end:
                 if matching_entry is None or (entry.end - entry.start) < (matching_entry.end - matching_entry.start):
                     matching_entry = entry
@@ -285,7 +282,8 @@ class VirtualMachine:
 
                 try:
                     result = handler(self, frame, instr)
-                    if result is not None:
+                    # Correctly terminate frame execution when a return opcode is processed
+                    if instr.opname in ("RETURN_VALUE", "RETURN_CONST"):
                         return result
                 except BaseException as exc:
                     handled = self._handle_exception(frame, instr.offset, exc)
@@ -618,7 +616,6 @@ def _push_exc_info(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> 
     new_exc = frame.top()
     prev_exc = vm.exc_value
     vm.exc_value = new_exc
-    # Python 3.11+: push prev_exc then new_exc
     frame.push(prev_exc)
     frame.push(new_exc)
 
@@ -626,8 +623,7 @@ def _push_exc_info(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> 
 @VirtualMachine.register("CHECK_EXC_MATCH")
 def _check_exc_match(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     target_type = frame.pop()
-    # In Python 3.11+, top of stack is exc (copied with COPY 1)
-    exc = frame.pop()
+    exc = frame.pop()  # Pop the tested exception copy
 
     if isinstance(exc, BaseException):
         match = isinstance(exc, target_type)
