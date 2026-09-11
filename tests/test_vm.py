@@ -1,11 +1,16 @@
 """
 Comprehensive unit test suite for PyVM execution engine.
 Verifies arithmetic, data structures, control flow, functions,
-recursion, and exception handling (try-except-finally).
+recursion, exception handling, and compiled bytecode (.pyc) execution.
 """
 
+import importlib.util
+import marshal
+import os
+import tempfile
 import unittest
 from vm import VirtualMachine
+from cli import PyVMCLI
 
 
 class TestPyVM(unittest.TestCase):
@@ -158,6 +163,30 @@ res = caller()
 """
         scope = self._execute(code)
         self.assertEqual(scope["res"], "recovered")
+
+    def test_pyc_file_execution(self) -> None:
+        """Compile a snippet, write a valid .pyc binary, and execute via PyVM."""
+        source = """
+pyc_magic = 42 * 2
+pyc_string = "pyc_success"
+"""
+        code_obj = compile(source, filename="<test_pyc>", mode="exec")
+
+        # Create temporary .pyc file with standard 16-byte header
+        header = importlib.util.MAGIC_NUMBER + b"\x00" * 12
+        with tempfile.NamedTemporaryFile(suffix=".pyc", delete=False) as tmp:
+            tmp.write(header)
+            marshal.dump(code_obj, tmp)
+            tmp_path = tmp.name
+
+        try:
+            cli = PyVMCLI()
+            cli.run_pyc_file(tmp_path)
+            self.assertEqual(cli.vm.globals["pyc_magic"], 84)
+            self.assertEqual(cli.vm.globals["pyc_string"], "pyc_success")
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
 
 if __name__ == "__main__":
