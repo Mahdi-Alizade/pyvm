@@ -1,61 +1,154 @@
 """
-Interactive REPL and CLI Runner for the custom Python Virtual Machine.
+PyVM Command-Line Interface & Interactive REPL.
+Supports interactive bytecode shell, script execution, and step-by-step tracing.
 """
 
+import argparse
 import sys
-import os
-from vm import VirtualMachine
+import traceback
+from typing import Optional
+from vm import VirtualMachine, Frame
 
 
-def run_repl() -> None:
-    """Run an interactive Read-Eval-Print-Loop (REPL) session using PyVM."""
-    print("PyVM - Python Bytecode Virtual Machine")
-    print("Type 'exit()' or press Ctrl+C to terminate session.\n")
+class PyVMCLI:
+    """CLI orchestrator for script execution and REPL."""
 
-    vm = VirtualMachine()
+    def __init__(self, trace: bool = False) -> None:
+        self.trace = trace
+        self.vm = VirtualMachine()
 
-    while True:
+    def _traced_run(self, code_obj) -> None:
+        """Execute bytecode with step-by-step console tracing."""
+        frame = Frame(
+            code_obj=code_obj,
+            globals_scope=self.vm.globals,
+            locals_scope=self.vm.globals,
+            builtins_scope=self.vm.builtins,
+        )
+        self.vm.frames.append(frame)
+
+        print("\n" + "=" * 70)
+        print(f"{'IP':<5} | {'OPCODE':<25} | {'ARG':<15} | {'STACK'}")
+        print("-" * 70)
+
         try:
-            line = input("pyvm >>> ")
-            if not line.strip():
-                continue
-            if line.strip() in ("exit()", "quit()"):
-                break
+            while frame.ip < len(frame.instructions):
+                instr = frame.instructions[frame.ip]
+                handler = self.vm._dispatch_table.get(instr.opname)
 
-            # Attempt to compile as single/eval expression first, fallback to exec mode
+                if handler is None:
+                    raise NotImplementedError(f"Opcode '{instr.opname}' is not supported.")
+
+                stack_repr = str(frame.stack) if frame.stack else "[]"
+                arg_repr = str(instr.argval) if instr.argval is not None else ""
+                if len(arg_repr) > 14:
+                    arg_repr = arg_repr[:11] + "..."
+
+                print(f"{frame.ip:<5} | {instr.opname:<25} | {arg_repr:<15} | {stack_repr}")
+
+                result = handler(self.vm, frame, instr)
+                if result is not None:
+                    print(f"\n[VM Exit Value]: {result}")
+                    return
+
+                frame.ip += 1
+        finally:
+            self.vm.frames.pop()
+            print("=" * 70 + "\n")
+
+    def run_source(self, source: str, filename: str = "<stdin>") -> None:
+        """Compile and execute source code within the VM instance."""
+        try:
+            code_obj = compile(source, filename=filename, mode="exec")
+            if self.trace:
+                self._traced_run(code_obj)
+            else:
+                self.vm.run_code(code_obj)
+        except Exception as exc:
+            traceback.print_exc(file=sys.stderr)
+
+    def run_file(self, filepath: str) -> None:
+        """Read a Python script file and run it inside the VM."""
+        try:
+            with open(filepath, "r", encoding="utf-8") as file:
+                source = file.read()
+            self.run_source(source, filename=filepath)
+        except FileNotFoundError:
+            print(f"[!] Error: File '{filepath}' not found.", file=sys.stderr)
+            sys.exit(1)
+
+    def repl(self) -> None:
+        """Run an interactive REPL session."""
+        print("PyVM - Python Bytecode Virtual Machine Shell")
+        print("Type '.help' for REPL commands or '.exit' to quit.\n")
+
+        buffer = []
+        while True:
             try:
-                code_obj = compile(line, filename="<stdin>", mode="single")
-            except SyntaxError:
-                code_obj = compile(line, filename="<stdin>", mode="exec")
+                prompt = "... " if buffer else "pyvm>>> "
+                line = input(prompt)
 
-            vm.run_code(code_obj)
+                stripped = line.strip()
 
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting PyVM.")
-            break
-        except Exception as err:
-            print(f"Runtime Exception: {err}")
+                if not buffer:
+                    if stripped in (".exit", "exit()", "quit()"):
+                        print("Goodbye!")
+                        break
+                    elif stripped == ".help":
+                        print("REPL Commands:")
+                        print("  .globals  - Show defined global variables")
+                        print("  .clear    - Clear current input buffer")
+                        print("  .exit     - Terminate session")
+                        continue
+                    elif stripped == ".globals":
+                        user_globals = {
+                            k: v for k, v in self.vm.globals.items() if not k.startswith("__")
+                        }
+                        print(user_globals)
+                        continue
+                    elif stripped == ".clear":
+                        buffer.clear()
+                        continue
 
+                # Handle multi-line block collection (e.g. def, for, if)
+                if line.endswith(":") or (buffer and line.startswith(" ")) or (buffer and line.strip()):
+                    buffer.append(line)
+                    continue
 
-def run_file(file_path: str) -> None:
-    """Read a python file and execute it on the custom VM."""
-    if not os.path.exists(file_path):
-        print(f"Error: File '{file_path}' does not exist.")
-        sys.exit(1)
+                if buffer:
+                    buffer.append(line)
+                    source = "\n".join(buffer)
+                    buffer.clear()
+                else:
+                    source = line
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        source_code = f.read()
+                if not source.strip():
+                    continue
 
-    code_obj = compile(source_code, filename=file_path, mode="exec")
-    vm = VirtualMachine()
-    vm.run_code(code_obj)
+                self.run_source(source)
+
+            except (KeyboardInterrupt, EOFError):
+                print("\nKeyboardInterrupt")
+                buffer.clear()
+                break
 
 
 def main() -> None:
-    if len(sys.argv) > 1:
-        run_file(sys.argv[1])
+    parser = argparse.ArgumentParser(description="PyVM - Python Bytecode Virtual Machine CLI")
+    parser.add_argument("script", nargs="?", help="Path to Python script file to execute")
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Enable step-by-step bytecode and stack tracer",
+    )
+
+    args = parser.parse_args()
+    cli = PyVMCLI(trace=args.trace)
+
+    if args.script:
+        cli.run_file(args.script)
     else:
-        run_repl()
+        cli.repl()
 
 
 if __name__ == "__main__":
