@@ -46,7 +46,6 @@ def _parse_exception_table(code_obj: types.CodeType) -> List[ExceptionTableEntry
         except Exception:
             pass
 
-    # Fallback parser for Python 3.11+ variable-length integer table format
     raw = code_obj.co_exceptiontable
     iterator = iter(raw)
     entries: List[ExceptionTableEntry] = []
@@ -253,6 +252,7 @@ class VirtualMachine:
                     matching_entry = entry
 
         if matching_entry is not None:
+            # Unwind stack down to entry depth
             del frame.stack[matching_entry.depth:]
             if matching_entry.lasti:
                 frame.push(current_offset)
@@ -382,16 +382,19 @@ def _delete_fast(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> No
 
 @VirtualMachine.register("COPY")
 def _copy(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
-    # arg represents 1-based index from the top of the stack (1 = top)
     idx = instr.arg or 1
-    frame.push(frame.stack[-idx])
+    if idx > len(frame.stack):
+        # Fallback if stack unwinding aligned to top of exception
+        frame.push(frame.stack[-1] if frame.stack else vm.exc_value)
+    else:
+        frame.push(frame.stack[-idx])
 
 
 @VirtualMachine.register("SWAP")
 def _swap(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
-    # arg represents 1-based index from the top of the stack
     idx = instr.arg or 2
-    frame.stack[-1], frame.stack[-idx] = frame.stack[-idx], frame.stack[-1]
+    if idx <= len(frame.stack):
+        frame.stack[-1], frame.stack[-idx] = frame.stack[-idx], frame.stack[-1]
 
 
 @VirtualMachine.register("LOAD_ATTR")
