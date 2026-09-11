@@ -1,14 +1,14 @@
 """
 A modular, high-performance Python Bytecode Virtual Machine.
-Uses a direct O(1) dispatch table pattern and isolated frame stacks.
-Fully compatible with Python 3.11 - 3.13 conventions.
+Uses a direct O(1) dispatch table pattern, isolated frame stacks,
+and native Exception Table unwinding compatible with Python 3.11 - 3.13.
 """
 
 import builtins
 import dis
 import operator
 import types
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 
 class _NullSentinel:
@@ -21,21 +21,88 @@ class _NullSentinel:
 
 NULL = _NullSentinel()
 
-# Cache disassembled instructions per code object to maximize speed
-_CODE_INSTRUCTION_CACHE: Dict[types.CodeType, Tuple[List[dis.Instruction], Dict[int, int]]] = {}
+
+class ExceptionTableEntry(NamedTuple):
+    """Represents a range of bytecode offsets covered by an exception handler."""
+    start: int
+    end: int
+    target: int
+    depth: int
+    lasti: bool
 
 
-def _get_cached_instructions(code_obj: types.CodeType) -> Tuple[List[dis.Instruction], Dict[int, int]]:
-    if code_obj not in _CODE_INSTRUCTION_CACHE:
+def _parse_exception_table(code_obj: types.CodeType) -> List[ExceptionTableEntry]:
+    """Parse modern co_exceptiontable into structured entries."""
+    if not hasattr(code_obj, "co_exceptiontable") or not code_obj.co_exceptiontable:
+        return []
+
+    if hasattr(dis, "_parse_exception_table"):
+        try:
+            raw_entries = dis._parse_exception_table(code_obj.co_exceptiontable)
+            return [
+                ExceptionTableEntry(e.start, e.end, e.target, e.depth, e.lasti)
+                for e in raw_entries
+            ]
+        except Exception:
+            pass
+
+    # Fallback parser for Python 3.11+ variable-length integer table format
+    raw = code_obj.co_exceptiontable
+    iterator = iter(raw)
+    entries: List[ExceptionTableEntry] = []
+
+    try:
+        while True:
+            def parse_varint() -> int:
+                b = next(iterator)
+                val = b & 63
+                while b & 64:
+                    val <<= 6
+                    b = next(iterator)
+                    val |= (b & 63)
+                return val
+
+            start = parse_varint() * 2
+            length = parse_varint() * 2
+            end = start + length
+            target = parse_varint() * 2
+            dl = parse_varint()
+            depth = dl >> 1
+            lasti = bool(dl & 1)
+            entries.append(ExceptionTableEntry(start, end, target, depth, lasti))
+    except StopIteration:
+        pass
+
+    return entries
+
+
+# Cache disassembled instructions, offsets, and exception tables per code object
+_CODE_CACHE: Dict[types.CodeType, Tuple[List[dis.Instruction], Dict[int, int], List[ExceptionTableEntry]]] = {}
+
+
+def _get_cached_code_data(code_obj: types.CodeType) -> Tuple[List[dis.Instruction], Dict[int, int], List[ExceptionTableEntry]]:
+    if code_obj not in _CODE_CACHE:
         instructions = list(dis.get_instructions(code_obj))
         offset_map = {instr.offset: idx for idx, instr in enumerate(instructions)}
-        _CODE_INSTRUCTION_CACHE[code_obj] = (instructions, offset_map)
-    return _CODE_INSTRUCTION_CACHE[code_obj]
+        exc_entries = _parse_exception_table(code_obj)
+        _CODE_CACHE[code_obj] = (instructions, offset_map, exc_entries)
+    return _CODE_CACHE[code_obj]
 
 
 class Frame:
     """Represents an isolated call frame with its own stack and instruction pointer."""
-    __slots__ = ("code_obj", "globals", "locals", "builtins", "stack", "instructions", "offset_to_index", "ip")
+    __slots__ = (
+        "code_obj",
+        "globals",
+        "locals",
+        "builtins",
+        "stack",
+        "instructions",
+        "offset_to_index",
+        "exception_entries",
+        "block_stack",
+        "ip",
+    )
 
     def __init__(
         self,
@@ -49,7 +116,12 @@ class Frame:
         self.locals = locals_scope
         self.builtins = builtins_scope
         self.stack: List[Any] = []
-        self.instructions, self.offset_to_index = _get_cached_instructions(code_obj)
+        (
+            self.instructions,
+            self.offset_to_index,
+            self.exception_entries,
+        ) = _get_cached_code_data(code_obj)
+        self.block_stack: List[Tuple[str, int, int]] = []
         self.ip: int = 0
 
     def push(self, value: Any) -> None:
@@ -96,13 +168,11 @@ class Function:
         local_env: Dict[str, Any] = {}
         arg_names = self.code_obj.co_varnames[: self.code_obj.co_argcount]
 
-        # Bind default parameters if provided
         if self.defaults:
             offset = len(arg_names) - len(self.defaults)
             for idx, default_val in enumerate(self.defaults):
                 local_env[arg_names[offset + idx]] = default_val
 
-        # Bind positional parameters
         for name, val in zip(arg_names, args):
             local_env[name] = val
 
@@ -116,7 +186,7 @@ class Function:
 
 
 class VirtualMachine:
-    """Execution engine with O(1) table-driven opcode dispatching."""
+    """Execution engine with O(1) table-driven opcode dispatching and exception handling."""
 
     _dispatch_table: Dict[str, Callable[["VirtualMachine", Frame, dis.Instruction], Any]] = {}
 
@@ -161,6 +231,7 @@ class VirtualMachine:
         self.globals: Dict[str, Any] = {}
         self.builtins: Dict[str, Any] = builtins.__dict__ if not isinstance(builtins, dict) else builtins
         self.frames: List[Frame] = []
+        self.exc_value: Optional[BaseException] = None
 
     def run_code(self, code_obj: types.CodeType, local_env: Optional[Dict[str, Any]] = None) -> Any:
         locals_scope = local_env if local_env is not None else self.globals
@@ -172,6 +243,32 @@ class VirtualMachine:
         )
         return self.run_frame(frame)
 
+    def _handle_exception(self, frame: Frame, current_offset: int, exc: BaseException) -> bool:
+        """Locate matching exception handler and unwind the stack."""
+        matching_entry: Optional[ExceptionTableEntry] = None
+
+        for entry in frame.exception_entries:
+            if entry.start <= current_offset < entry.end:
+                if matching_entry is None or (entry.end - entry.start) < (matching_entry.end - matching_entry.start):
+                    matching_entry = entry
+
+        if matching_entry is not None:
+            del frame.stack[matching_entry.depth:]
+            if matching_entry.lasti:
+                frame.push(current_offset)
+            frame.push(exc)
+            frame.ip = frame.offset_to_index[matching_entry.target] - 1
+            return True
+
+        if frame.block_stack:
+            _, target_offset, depth = frame.block_stack.pop()
+            del frame.stack[depth:]
+            frame.push(exc)
+            frame.ip = frame.offset_to_index[target_offset] - 1
+            return True
+
+        return False
+
     def run_frame(self, frame: Frame) -> Any:
         self.frames.append(frame)
         try:
@@ -182,9 +279,14 @@ class VirtualMachine:
                 if handler is None:
                     raise NotImplementedError(f"Opcode '{instr.opname}' is not supported.")
 
-                result = handler(self, frame, instr)
-                if result is not None:
-                    return result
+                try:
+                    result = handler(self, frame, instr)
+                    if result is not None:
+                        return result
+                except BaseException as exc:
+                    handled = self._handle_exception(frame, instr.offset, exc)
+                    if not handled:
+                        raise
 
                 frame.ip += 1
         finally:
@@ -430,15 +532,12 @@ def _push_null(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None
 def _call(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     argc = instr.arg or 0
     args = frame.popn(argc)
-
     candidate = frame.pop()
 
-    # If the item popped is NULL, the real callable is below it
     if candidate is NULL:
         callable_target = frame.pop()
     else:
         callable_target = candidate
-        # If NULL is directly below the callable, clean it up
         if frame.stack and frame.top() is NULL:
             frame.pop()
 
@@ -459,6 +558,79 @@ def _return_value(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> A
 def _pop_top(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     if frame.stack:
         frame.pop()
+
+
+# ---------------------------------------------------------
+# Exception Handling Opcodes
+# ---------------------------------------------------------
+
+@VirtualMachine.register("PUSH_EXC_INFO")
+def _push_exc_info(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    new_exc = frame.pop()
+    prev_exc = vm.exc_value
+    vm.exc_value = new_exc
+    frame.push(prev_exc)
+    frame.push(new_exc)
+
+
+@VirtualMachine.register("CHECK_EXC_MATCH")
+def _check_exc_match(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    target_type = frame.pop()
+    exc = frame.top()
+
+    if isinstance(exc, BaseException):
+        match = isinstance(exc, target_type)
+    elif isinstance(exc, type) and issubclass(exc, BaseException):
+        match = issubclass(exc, target_type)
+    else:
+        match = False
+
+    frame.push(match)
+
+
+@VirtualMachine.register("POP_EXCEPT")
+def _pop_except(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    from_exc = frame.pop()
+    vm.exc_value = from_exc
+
+
+@VirtualMachine.register("RERAISE")
+def _reraise(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    exc = frame.pop()
+    if frame.stack and (frame.top() is None or isinstance(frame.top(), BaseException)):
+        vm.exc_value = frame.pop()
+    raise exc
+
+
+@VirtualMachine.register("RAISE_VARARGS")
+def _raise_varargs(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    argc = instr.arg or 0
+    if argc == 0:
+        if vm.exc_value:
+            raise vm.exc_value
+        raise RuntimeError("No active exception to reraise")
+    elif argc == 1:
+        exc = frame.pop()
+        if isinstance(exc, type) and issubclass(exc, BaseException):
+            raise exc()
+        raise exc
+    elif argc == 2:
+        cause = frame.pop()
+        exc = frame.pop()
+        if isinstance(exc, type) and issubclass(exc, BaseException):
+            exc = exc()
+        raise exc from cause
+
+
+@VirtualMachine.register("SETUP_FINALLY")
+def _setup_finally(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    frame.block_stack.append(("finally", instr.argval, len(frame.stack)))
+
+
+@VirtualMachine.register("POP_BLOCK")
+def _pop_block(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    if frame.block_stack:
+        frame.block_stack.pop()
 
 
 @VirtualMachine.register("RESUME", "NOP", "PRECALL", "CACHE")
