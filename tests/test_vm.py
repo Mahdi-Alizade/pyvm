@@ -1,6 +1,7 @@
 """
 Comprehensive unit test suite for PyVM execution engine.
-Verifies arithmetic, data structures, control flow, functions, and recursion.
+Verifies arithmetic, data structures, control flow, functions,
+recursion, and exception handling (try-except-finally).
 """
 
 import unittest
@@ -118,6 +119,45 @@ fact6 = factorial(6)
         scope = self._execute(code)
         self.assertEqual(scope["fact5"], 120)
         self.assertEqual(scope["fact6"], 720)
+
+    def test_try_except_zerodivision(self) -> None:
+        code = """
+status = "initial"
+try:
+    bad_math = 10 / 0
+except ZeroDivisionError:
+    status = "caught"
+"""
+        scope = self._execute(code)
+        self.assertEqual(scope["status"], "caught")
+
+    def test_try_except_custom_raise(self) -> None:
+        code = """
+caught_msg = ""
+try:
+    raise ValueError("custom error")
+except ValueError as err:
+    caught_msg = str(err)
+"""
+        scope = self._execute(code)
+        self.assertEqual(scope["caught_msg"], "custom error")
+
+    def test_try_except_cross_function_unwinding(self) -> None:
+        code = """
+def fail():
+    return 1 / 0
+
+def caller():
+    try:
+        fail()
+        return "not reached"
+    except ZeroDivisionError:
+        return "recovered"
+
+res = caller()
+"""
+        scope = self._execute(code)
+        self.assertEqual(scope["res"], "recovered")
 
 
 if __name__ == "__main__":
