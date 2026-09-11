@@ -1,7 +1,7 @@
 """
 A modular, high-performance Python Bytecode Virtual Machine.
-Uses a direct O(1) dispatch table pattern instead of monolithic branching.
-Supports Python 3.11 - 3.13 calling conventions and data structures.
+Uses a direct O(1) dispatch table pattern and isolated frame stacks.
+Fully compatible with Python 3.11 - 3.13 conventions.
 """
 
 import builtins
@@ -21,6 +21,17 @@ class _NullSentinel:
 
 NULL = _NullSentinel()
 
+# Global cache for disassembled instructions to prevent redundant dis.get_instructions calls
+_CODE_INSTRUCTION_CACHE: Dict[types.CodeType, Tuple[List[dis.Instruction], Dict[int, int]]] = {}
+
+
+def _get_cached_instructions(code_obj: types.CodeType) -> Tuple[List[dis.Instruction], Dict[int, int]]:
+    if code_obj not in _CODE_INSTRUCTION_CACHE:
+        instructions = list(dis.get_instructions(code_obj))
+        offset_map = {instr.offset: idx for idx, instr in enumerate(instructions)}
+        _CODE_INSTRUCTION_CACHE[code_obj] = (instructions, offset_map)
+    return _CODE_INSTRUCTION_CACHE[code_obj]
+
 
 class Frame:
     """Represents an isolated call frame with its own stack and instruction pointer."""
@@ -38,10 +49,7 @@ class Frame:
         self.locals = locals_scope
         self.builtins = builtins_scope
         self.stack: List[Any] = []
-        self.instructions: List[dis.Instruction] = list(dis.get_instructions(code_obj))
-        self.offset_to_index: Dict[int, int] = {
-            instr.offset: idx for idx, instr in enumerate(self.instructions)
-        }
+        self.instructions, self.offset_to_index = _get_cached_instructions(code_obj)
         self.ip: int = 0
 
     def push(self, value: Any) -> None:
@@ -414,22 +422,11 @@ def _push_null(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None
 def _call(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     argc = instr.arg or 0
     args = frame.popn(argc)
+    callable_target = frame.pop()
 
-    item1 = frame.pop()
-
-    # In Python 3.11+, stack layout is: NULL (or self) -> callable -> args...
-    # If item1 is NULL, it means the stack was misaligned or NULL was placed on top;
-    # otherwise item1 is the callable target, and NULL (or self) sits beneath it.
-    if item1 is NULL:
-        callable_target = frame.pop()
-        self_or_null = None
-    else:
-        callable_target = item1
-        self_or_null = frame.pop() if frame.stack else None
-
-    # If self_or_null is a bound receiver (not NULL), prepend it to args
-    if self_or_null is not None and self_or_null is not NULL:
-        args.insert(0, self_or_null)
+    # If PUSH_NULL was executed before loading the function, discard that sentinel
+    if frame.stack and frame.top() is NULL:
+        frame.pop()
 
     frame.push(callable_target(*args))
 
