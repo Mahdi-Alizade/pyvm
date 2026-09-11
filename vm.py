@@ -319,6 +319,15 @@ def _store_global(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> N
     frame.globals[instr.argval] = frame.pop()
 
 
+@VirtualMachine.register("DELETE_GLOBAL")
+def _delete_global(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    name = instr.argval
+    if name in frame.globals:
+        del frame.globals[name]
+    else:
+        raise NameError(f"global name '{name}' is not defined")
+
+
 @VirtualMachine.register("LOAD_NAME")
 def _load_name(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     name = instr.argval
@@ -337,6 +346,17 @@ def _store_name(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> Non
     frame.locals[instr.argval] = frame.pop()
 
 
+@VirtualMachine.register("DELETE_NAME")
+def _delete_name(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    name = instr.argval
+    if name in frame.locals:
+        del frame.locals[name]
+    elif name in frame.globals:
+        del frame.globals[name]
+    else:
+        raise NameError(f"name '{name}' is not defined")
+
+
 @VirtualMachine.register("LOAD_FAST")
 def _load_fast(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     name = instr.argval
@@ -349,6 +369,29 @@ def _load_fast(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None
 @VirtualMachine.register("STORE_FAST")
 def _store_fast(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     frame.locals[instr.argval] = frame.pop()
+
+
+@VirtualMachine.register("DELETE_FAST")
+def _delete_fast(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    name = instr.argval
+    if name in frame.locals:
+        del frame.locals[name]
+    else:
+        raise UnboundLocalError(f"local variable '{name}' referenced before assignment")
+
+
+@VirtualMachine.register("COPY")
+def _copy(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    # arg represents 1-based index from the top of the stack (1 = top)
+    idx = instr.arg or 1
+    frame.push(frame.stack[-idx])
+
+
+@VirtualMachine.register("SWAP")
+def _swap(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    # arg represents 1-based index from the top of the stack
+    idx = instr.arg or 2
+    frame.stack[-1], frame.stack[-idx] = frame.stack[-idx], frame.stack[-1]
 
 
 @VirtualMachine.register("LOAD_ATTR")
