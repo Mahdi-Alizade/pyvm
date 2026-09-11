@@ -1,16 +1,19 @@
 """
-A robust, frame-based Python Bytecode Virtual Machine implemented in pure Python.
-Supports Python 3.11 - 3.13 bytecode conventions.
+A modular, high-performance Python Bytecode Virtual Machine.
+Uses a direct O(1) dispatch table pattern instead of monolithic branching.
 """
 
 import builtins
 import dis
+import operator
 import types
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 class _NullSentinel:
-    """Represents the NULL pushed by PUSH_NULL in modern CPython frames."""
+    """Represents the NULL pushed by PUSH_NULL in modern Python bytecode."""
+    __slots__ = ()
+
     def __repr__(self) -> str:
         return "<NULL>"
 
@@ -19,10 +22,8 @@ NULL = _NullSentinel()
 
 
 class Frame:
-    """
-    Represents an isolated call frame containing its own stack,
-    instruction pointer, locals, and reference to globals.
-    """
+    """Represents an isolated call frame with its own stack and instruction pointer."""
+    __slots__ = ("code_obj", "globals", "locals", "builtins", "stack", "instructions", "offset_to_index", "ip")
 
     def __init__(
         self,
@@ -32,9 +33,9 @@ class Frame:
         builtins_scope: Dict[str, Any],
     ) -> None:
         self.code_obj = code_obj
-        self.globals: Dict[str, Any] = globals_scope
-        self.locals: Dict[str, Any] = locals_scope
-        self.builtins: Dict[str, Any] = builtins_scope
+        self.globals = globals_scope
+        self.locals = locals_scope
+        self.builtins = builtins_scope
         self.stack: List[Any] = []
         self.instructions: List[dis.Instruction] = list(dis.get_instructions(code_obj))
         self.offset_to_index: Dict[int, int] = {
@@ -46,25 +47,36 @@ class Frame:
         self.stack.append(value)
 
     def pop(self) -> Any:
-        if not self.stack:
-            raise IndexError("pop from empty execution stack")
-        return self.stack.pop()
+        try:
+            return self.stack.pop()
+        except IndexError:
+            raise IndexError("pop from empty execution stack") from None
 
     def top(self) -> Any:
-        if not self.stack:
-            raise IndexError("peek from empty execution stack")
-        return self.stack[-1]
+        try:
+            return self.stack[-1]
+        except IndexError:
+            raise IndexError("peek from empty execution stack") from None
+
+    def popn(self, n: int) -> List[Any]:
+        """Pop n items maintaining original order."""
+        if n == 0:
+            return []
+        items = self.stack[-n:]
+        del self.stack[-n:]
+        return items
 
 
 class Function:
-    """Represents a callable function inside the custom Virtual Machine."""
+    """User-defined callable function inside the VM."""
+    __slots__ = ("code_obj", "vm", "name", "defaults")
 
     def __init__(
         self,
         code_obj: types.CodeType,
         vm: "VirtualMachine",
         name: Optional[str] = None,
-        defaults: tuple = (),
+        defaults: Tuple[Any, ...] = (),
     ) -> None:
         self.code_obj = code_obj
         self.vm = vm
@@ -73,17 +85,17 @@ class Function:
 
     def __call__(self, *args: Any) -> Any:
         local_env: Dict[str, Any] = {}
-
-        # Bind default arguments first
         arg_names = self.code_obj.co_varnames[: self.code_obj.co_argcount]
+
+        # Bind default parameters if provided
         if self.defaults:
             offset = len(arg_names) - len(self.defaults)
             for idx, default_val in enumerate(self.defaults):
                 local_env[arg_names[offset + idx]] = default_val
 
-        # Bind positional arguments
-        for var_name, arg_val in zip(arg_names, args):
-            local_env[var_name] = arg_val
+        # Bind positional parameters
+        for name, val in zip(arg_names, args):
+            local_env[name] = val
 
         frame = Frame(
             code_obj=self.code_obj,
@@ -95,48 +107,54 @@ class Function:
 
 
 class VirtualMachine:
-    """
-    Stack-based Virtual Machine capable of executing Python bytecode
-    using frame-isolated stacks.
-    """
+    """Execution engine with O(1) table-driven opcode dispatching."""
+
+    # Static registry of opcode handlers
+    _dispatch_table: Dict[str, Callable[["VirtualMachine", Frame, dis.Instruction], Any]] = {}
+
+    BINARY_OPS: Dict[str, Callable[[Any, Any], Any]] = {
+        "+": operator.add,
+        "-": operator.sub,
+        "*": operator.mul,
+        "/": operator.truediv,
+        "//": operator.floordiv,
+        "%": operator.mod,
+        "**": operator.pow,
+        "&": operator.and_,
+        "|": operator.or_,
+        "^": operator.xor,
+        "<<": operator.lshift,
+        ">>": operator.rshift,
+    }
+
+    COMPARE_OPS: Dict[str, Callable[[Any, Any], bool]] = {
+        "==": operator.eq,
+        "!=": operator.ne,
+        "<": operator.lt,
+        "<=": operator.le,
+        ">": operator.gt,
+        ">=": operator.ge,
+        "in": lambda a, b: a in b,
+        "not in": lambda a, b: a not in b,
+        "is": operator.is_,
+        "is not": operator.is_not,
+    }
+
+    @classmethod
+    def register(cls, *opnames: str):
+        """Decorator to map opcodes directly into the dispatch table."""
+        def decorator(func: Callable[["VirtualMachine", Frame, dis.Instruction], Any]):
+            for op in opnames:
+                cls._dispatch_table[op] = func
+            return func
+        return decorator
 
     def __init__(self) -> None:
         self.globals: Dict[str, Any] = {}
-        if isinstance(builtins, dict):
-            self.builtins: Dict[str, Any] = builtins
-        else:
-            self.builtins: Dict[str, Any] = builtins.__dict__
+        self.builtins: Dict[str, Any] = builtins.__dict__ if not isinstance(builtins, dict) else builtins
         self.frames: List[Frame] = []
 
-    def _eval_compare(self, left: Any, right: Any, raw_op: str) -> bool:
-        op = raw_op.replace("bool(", "").replace(")", "").strip()
-
-        if op == "==":
-            return left == right
-        elif op == "!=":
-            return left != right
-        elif op == "<":
-            return left < right
-        elif op == "<=":
-            return left <= right
-        elif op == ">":
-            return left > right
-        elif op == ">=":
-            return left >= right
-        elif op in ("in", "IN"):
-            return left in right
-        elif op in ("not in", "NOT_IN"):
-            return left not in right
-        elif op in ("is", "IS"):
-            return left is right
-        elif op in ("is not", "IS_NOT"):
-            return left is not right
-        else:
-            raise NotImplementedError(f"Unsupported comparison operator: '{raw_op}'")
-
-    def run_code(
-        self, code_obj: types.CodeType, local_env: Optional[Dict[str, Any]] = None
-    ) -> Any:
+    def run_code(self, code_obj: types.CodeType, local_env: Optional[Dict[str, Any]] = None) -> Any:
         locals_scope = local_env if local_env is not None else self.globals
         frame = Frame(
             code_obj=code_obj,
@@ -148,264 +166,257 @@ class VirtualMachine:
 
     def run_frame(self, frame: Frame) -> Any:
         self.frames.append(frame)
-
         try:
             while frame.ip < len(frame.instructions):
                 instr = frame.instructions[frame.ip]
-                opname = instr.opname
-                argval = instr.argval
-                jump_taken = False
+                handler = self._dispatch_table.get(instr.opname)
 
-                # Constants
-                if opname == "LOAD_CONST":
-                    frame.push(argval)
+                if handler is None:
+                    raise NotImplementedError(f"Opcode '{instr.opname}' is not supported.")
 
-                # Scope: Globals & Builtins
-                elif opname == "LOAD_GLOBAL":
-                    if argval in frame.globals:
-                        frame.push(frame.globals[argval])
-                    elif argval in frame.builtins:
-                        frame.push(frame.builtins[argval])
-                    else:
-                        raise NameError(f"global name '{argval}' is not defined")
+                # Handlers can return a value (for RETURN_*) or modify frame.ip directly
+                result = handler(self, frame, instr)
+                if result is not None:
+                    return result
 
-                elif opname == "STORE_GLOBAL":
-                    frame.globals[argval] = frame.pop()
-
-                # Scope: Names
-                elif opname == "LOAD_NAME":
-                    if argval in frame.locals:
-                        frame.push(frame.locals[argval])
-                    elif argval in frame.globals:
-                        frame.push(frame.globals[argval])
-                    elif argval in frame.builtins:
-                        frame.push(frame.builtins[argval])
-                    else:
-                        raise NameError(f"name '{argval}' is not defined")
-
-                elif opname == "STORE_NAME":
-                    frame.locals[argval] = frame.pop()
-
-                # Scope: Locals (Fast)
-                elif opname == "LOAD_FAST":
-                    if argval in frame.locals:
-                        frame.push(frame.locals[argval])
-                    else:
-                        raise UnboundLocalError(
-                            f"local variable '{argval}' referenced before assignment"
-                        )
-
-                elif opname == "STORE_FAST":
-                    frame.locals[argval] = frame.pop()
-
-                # Attributes
-                elif opname == "LOAD_ATTR":
-                    owner = frame.pop()
-                    attr_name = argval if isinstance(argval, str) else instr.argrepr
-                    frame.push(getattr(owner, attr_name))
-
-                elif opname == "STORE_ATTR":
-                    val = frame.pop()
-                    owner = frame.pop()
-                    attr_name = argval if isinstance(argval, str) else instr.argrepr
-                    setattr(owner, attr_name, val)
-
-                # Subscripting & Slicing
-                elif opname == "BINARY_SUBSCR":
-                    sub = frame.pop()
-                    container = frame.pop()
-                    frame.push(container[sub])
-
-                elif opname == "STORE_SUBSCR":
-                    sub = frame.pop()
-                    container = frame.pop()
-                    val = frame.pop()
-                    container[sub] = val
-
-                # Data Structures
-                elif opname == "BUILD_LIST":
-                    count = instr.arg if instr.arg is not None else 0
-                    items = [frame.pop() for _ in range(count)]
-                    items.reverse()
-                    frame.push(items)
-
-                elif opname == "BUILD_MAP":
-                    count = instr.arg if instr.arg is not None else 0
-                    mapping: Dict[Any, Any] = {}
-                    pairs = [frame.pop() for _ in range(count * 2)]
-                    pairs.reverse()
-                    for idx in range(0, len(pairs), 2):
-                        mapping[pairs[idx]] = pairs[idx + 1]
-                    frame.push(mapping)
-
-                elif opname == "BUILD_TUPLE":
-                    count = instr.arg if instr.arg is not None else 0
-                    items = [frame.pop() for _ in range(count)]
-                    items.reverse()
-                    frame.push(tuple(items))
-
-                elif opname == "BUILD_SET":
-                    count = instr.arg if instr.arg is not None else 0
-                    items = [frame.pop() for _ in range(count)]
-                    frame.push(set(items))
-
-                elif opname == "LIST_EXTEND":
-                    i = instr.arg if instr.arg is not None else 1
-                    items_to_extend = frame.pop()
-                    target_list = frame.stack[-i]
-                    target_list.extend(items_to_extend)
-
-                elif opname == "LIST_APPEND":
-                    i = instr.arg if instr.arg is not None else 1
-                    item_to_append = frame.pop()
-                    target_list = frame.stack[-i]
-                    target_list.append(item_to_append)
-
-                # Arithmetic & Unary
-                elif opname == "UNARY_NEGATIVE":
-                    frame.push(-frame.pop())
-
-                elif opname == "UNARY_NOT":
-                    frame.push(not frame.pop())
-
-                elif opname == "UNARY_INVERT":
-                    frame.push(~frame.pop())
-
-                elif opname in (
-                    "BINARY_OP",
-                    "BINARY_ADD",
-                    "BINARY_SUBTRACT",
-                    "BINARY_MULTIPLY",
-                    "BINARY_TRUE_DIVIDE",
-                    "BINARY_FLOOR_DIVIDE",
-                    "BINARY_MODULO",
-                    "BINARY_POWER",
-                ):
-                    right = frame.pop()
-                    left = frame.pop()
-                    sym = instr.argrepr.replace("=", "").strip()
-
-                    if opname == "BINARY_ADD" or sym == "+":
-                        frame.push(left + right)
-                    elif opname == "BINARY_SUBTRACT" or sym == "-":
-                        frame.push(left - right)
-                    elif opname == "BINARY_MULTIPLY" or sym == "*":
-                        frame.push(left * right)
-                    elif opname == "BINARY_TRUE_DIVIDE" or sym == "/":
-                        frame.push(left / right)
-                    elif opname == "BINARY_FLOOR_DIVIDE" or sym == "//":
-                        frame.push(left // right)
-                    elif opname == "BINARY_MODULO" or sym == "%":
-                        frame.push(left % right)
-                    elif opname == "BINARY_POWER" or sym == "**":
-                        frame.push(left ** right)
-                    elif sym == "&":
-                        frame.push(left & right)
-                    elif sym == "|":
-                        frame.push(left | right)
-                    elif sym == "^":
-                        frame.push(left ^ right)
-                    elif sym == "<<":
-                        frame.push(left << right)
-                    elif sym == ">>":
-                        frame.push(left >> right)
-                    else:
-                        raise NotImplementedError(f"Unsupported binary operation: {instr.argrepr}")
-
-                # Comparisons
-                elif opname == "COMPARE_OP":
-                    right = frame.pop()
-                    left = frame.pop()
-                    frame.push(self._eval_compare(left, right, instr.argrepr))
-
-                # Control Flow & Jumps
-                elif opname in ("JUMP_FORWARD", "JUMP_BACKWARD", "JUMP_ABSOLUTE"):
-                    frame.ip = frame.offset_to_index[instr.argval]
-                    jump_taken = True
-
-                elif opname in (
-                    "POP_JUMP_IF_FALSE",
-                    "POP_JUMP_FORWARD_IF_FALSE",
-                    "POP_JUMP_BACKWARD_IF_FALSE",
-                ):
-                    val = frame.pop()
-                    if not bool(val):
-                        frame.ip = frame.offset_to_index[instr.argval]
-                        jump_taken = True
-
-                elif opname in (
-                    "POP_JUMP_IF_TRUE",
-                    "POP_JUMP_FORWARD_IF_TRUE",
-                    "POP_JUMP_BACKWARD_IF_TRUE",
-                ):
-                    val = frame.pop()
-                    if bool(val):
-                        frame.ip = frame.offset_to_index[instr.argval]
-                        jump_taken = True
-
-                # Iterators
-                elif opname == "GET_ITER":
-                    frame.push(iter(frame.pop()))
-
-                elif opname in ("FOR_ITER", "FOR_ITER_GEN"):
-                    iterator = frame.top()
-                    try:
-                        frame.push(next(iterator))
-                    except StopIteration:
-                        frame.pop()
-                        frame.ip = frame.offset_to_index[instr.argval]
-                        jump_taken = True
-
-                elif opname == "END_FOR":
-                    if frame.stack and not isinstance(frame.top(), (int, float, str, dict, list)):
-                        frame.pop()
-
-                # Functions & Calls
-                elif opname == "MAKE_FUNCTION":
-                    code_target = frame.pop()
-                    func_obj = Function(code_target, self)
-                    frame.push(func_obj)
-
-                elif opname == "PUSH_NULL":
-                    frame.push(NULL)
-
-                elif opname in ("CALL", "CALL_FUNCTION"):
-                    argc = instr.arg if instr.arg is not None else 0
-                    args = [frame.pop() for _ in range(argc)]
-                    args.reverse()
-
-                    callable_target = frame.pop()
-
-                    # Discard NULL prefix if placed by PUSH_NULL
-                    if frame.stack and frame.top() is NULL:
-                        frame.pop()
-
-                    result = callable_target(*args)
-                    frame.push(result)
-
-                # Returns & Cleanup
-                elif opname == "RETURN_CONST":
-                    return argval
-
-                elif opname == "RETURN_VALUE":
-                    return frame.pop() if frame.stack else None
-
-                elif opname == "POP_TOP":
-                    if frame.stack:
-                        frame.pop()
-
-                elif opname in ("RESUME", "NOP", "PRECALL", "CACHE"):
-                    pass
-
-                else:
-                    raise NotImplementedError(
-                        f"Opcode '{opname}' (arg={instr.arg}, argval={instr.argval}) is not supported."
-                    )
-
-                if not jump_taken:
-                    frame.ip += 1
-
+                frame.ip += 1
         finally:
             self.frames.pop()
-
         return None
+
+
+# ---------------------------------------------------------
+# Opcode Handlers Registration (Clean, Modular & Isolated)
+# ---------------------------------------------------------
+
+@VirtualMachine.register("LOAD_CONST")
+def _load_const(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    frame.push(instr.argval)
+
+
+@VirtualMachine.register("LOAD_GLOBAL")
+def _load_global(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    name = instr.argval
+    if name in frame.globals:
+        frame.push(frame.globals[name])
+    elif name in frame.builtins:
+        frame.push(frame.builtins[name])
+    else:
+        raise NameError(f"global name '{name}' is not defined")
+
+
+@VirtualMachine.register("STORE_GLOBAL")
+def _store_global(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    frame.globals[instr.argval] = frame.pop()
+
+
+@VirtualMachine.register("LOAD_NAME")
+def _load_name(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    name = instr.argval
+    if name in frame.locals:
+        frame.push(frame.locals[name])
+    elif name in frame.globals:
+        frame.push(frame.globals[name])
+    elif name in frame.builtins:
+        frame.push(frame.builtins[name])
+    else:
+        raise NameError(f"name '{name}' is not defined")
+
+
+@VirtualMachine.register("STORE_NAME")
+def _store_name(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    frame.locals[instr.argval] = frame.pop()
+
+
+@VirtualMachine.register("LOAD_FAST")
+def _load_fast(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    name = instr.argval
+    if name in frame.locals:
+        frame.push(frame.locals[name])
+    else:
+        raise UnboundLocalError(f"local variable '{name}' referenced before assignment")
+
+
+@VirtualMachine.register("STORE_FAST")
+def _store_fast(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    frame.locals[instr.argval] = frame.pop()
+
+
+@VirtualMachine.register("LOAD_ATTR")
+def _load_attr(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    owner = frame.pop()
+    attr = instr.argval if isinstance(instr.argval, str) else instr.argrepr
+    frame.push(getattr(owner, attr))
+
+
+@VirtualMachine.register("STORE_ATTR")
+def _store_attr(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    val = frame.pop()
+    owner = frame.pop()
+    attr = instr.argval if isinstance(instr.argval, str) else instr.argrepr
+    setattr(owner, attr, val)
+
+
+@VirtualMachine.register("BINARY_SUBSCR")
+def _binary_subscr(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    sub = frame.pop()
+    container = frame.pop()
+    frame.push(container[sub])
+
+
+@VirtualMachine.register("STORE_SUBSCR")
+def _store_subscr(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    sub = frame.pop()
+    container = frame.pop()
+    container[sub] = frame.pop()
+
+
+@VirtualMachine.register("BUILD_LIST")
+def _build_list(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    frame.push(frame.popn(instr.arg or 0))
+
+
+@VirtualMachine.register("BUILD_TUPLE")
+def _build_tuple(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    frame.push(tuple(frame.popn(instr.arg or 0)))
+
+
+@VirtualMachine.register("BUILD_SET")
+def _build_set(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    frame.push(set(frame.popn(instr.arg or 0)))
+
+
+@VirtualMachine.register("BUILD_MAP")
+def _build_map(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    count = instr.arg or 0
+    items = frame.popn(count * 2)
+    frame.push({items[i]: items[i + 1] for i in range(0, len(items), 2)})
+
+
+@VirtualMachine.register("LIST_EXTEND")
+def _list_extend(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    items = frame.pop()
+    target_list = frame.stack[-(instr.arg or 1)]
+    target_list.extend(items)
+
+
+@VirtualMachine.register("LIST_APPEND")
+def _list_append(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    item = frame.pop()
+    target_list = frame.stack[-(instr.arg or 1)]
+    target_list.append(item)
+
+
+@VirtualMachine.register("UNARY_NEGATIVE", "UNARY_NOT", "UNARY_INVERT")
+def _unary_ops(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    val = frame.pop()
+    if instr.opname == "UNARY_NEGATIVE":
+        frame.push(-val)
+    elif instr.opname == "UNARY_NOT":
+        frame.push(not val)
+    else:
+        frame.push(~val)
+
+
+@VirtualMachine.register("BINARY_OP", "BINARY_ADD", "BINARY_SUBTRACT", "BINARY_MULTIPLY", "BINARY_TRUE_DIVIDE")
+def _binary_ops(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    right = frame.pop()
+    left = frame.pop()
+    sym = instr.argrepr.replace("=", "").strip()
+    op_func = vm.BINARY_OPS.get(sym)
+    if op_func is None:
+        raise NotImplementedError(f"Unsupported binary operator: '{instr.argrepr}'")
+    frame.push(op_func(left, right))
+
+
+@VirtualMachine.register("COMPARE_OP")
+def _compare_op(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    right = frame.pop()
+    left = frame.pop()
+    raw = instr.argrepr.replace("bool(", "").replace(")", "").strip()
+    cmp_func = vm.COMPARE_OPS.get(raw)
+    if cmp_func is None:
+        raise NotImplementedError(f"Unsupported comparison operator: '{raw}'")
+    frame.push(cmp_func(left, right))
+
+
+@VirtualMachine.register("JUMP_FORWARD", "JUMP_BACKWARD", "JUMP_ABSOLUTE")
+def _jump(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    frame.ip = frame.offset_to_index[instr.argval] - 1
+
+
+@VirtualMachine.register("POP_JUMP_IF_FALSE", "POP_JUMP_FORWARD_IF_FALSE", "POP_JUMP_BACKWARD_IF_FALSE")
+def _jump_if_false(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    if not bool(frame.pop()):
+        frame.ip = frame.offset_to_index[instr.argval] - 1
+
+
+@VirtualMachine.register("POP_JUMP_IF_TRUE", "POP_JUMP_FORWARD_IF_TRUE", "POP_JUMP_BACKWARD_IF_TRUE")
+def _jump_if_true(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    if bool(frame.pop()):
+        frame.ip = frame.offset_to_index[instr.argval] - 1
+
+
+@VirtualMachine.register("GET_ITER")
+def _get_iter(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    frame.push(iter(frame.pop()))
+
+
+@VirtualMachine.register("FOR_ITER", "FOR_ITER_GEN")
+def _for_iter(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    iterator = frame.top()
+    try:
+        frame.push(next(iterator))
+    except StopIteration:
+        frame.pop()
+        frame.ip = frame.offset_to_index[instr.argval] - 1
+
+
+@VirtualMachine.register("END_FOR")
+def _end_for(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    if frame.stack and not isinstance(frame.top(), (int, float, str, dict, list)):
+        frame.pop()
+
+
+@VirtualMachine.register("MAKE_FUNCTION")
+def _make_function(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    code_target = frame.pop()
+    frame.push(Function(code_target, vm))
+
+
+@VirtualMachine.register("PUSH_NULL")
+def _push_null(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    frame.push(NULL)
+
+
+@VirtualMachine.register("CALL", "CALL_FUNCTION")
+def _call(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    argc = instr.arg or 0
+    args = frame.popn(argc)
+    callable_target = frame.pop()
+
+    if frame.stack and frame.top() is NULL:
+        frame.pop()
+
+    frame.push(callable_target(*args))
+
+
+@VirtualMachine.register("RETURN_CONST")
+def _return_const(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> Any:
+    return instr.argval
+
+
+@VirtualMachine.register("RETURN_VALUE")
+def _return_value(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> Any:
+    return frame.pop() if frame.stack else None
+
+
+@VirtualMachine.register("POP_TOP")
+def _pop_top(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    if frame.stack:
+        frame.pop()
+
+
+@VirtualMachine.register("RESUME", "NOP", "PRECALL", "CACHE")
+def _noop(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    pass
