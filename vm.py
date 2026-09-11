@@ -21,7 +21,7 @@ class _NullSentinel:
 
 NULL = _NullSentinel()
 
-# Global cache for disassembled instructions to prevent redundant dis.get_instructions calls
+# Cache disassembled instructions per code object to maximize speed
 _CODE_INSTRUCTION_CACHE: Dict[types.CodeType, Tuple[List[dis.Instruction], Dict[int, int]]] = {}
 
 
@@ -300,6 +300,14 @@ def _build_map(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None
     frame.push({items[i]: items[i + 1] for i in range(0, len(items), 2)})
 
 
+@VirtualMachine.register("BUILD_CONST_KEY_MAP")
+def _build_const_key_map(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    keys = frame.pop()
+    count = len(keys)
+    values = frame.popn(count)
+    frame.push(dict(zip(keys, values)))
+
+
 @VirtualMachine.register("LIST_EXTEND")
 def _list_extend(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     items = frame.pop()
@@ -422,11 +430,17 @@ def _push_null(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None
 def _call(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     argc = instr.arg or 0
     args = frame.popn(argc)
-    callable_target = frame.pop()
 
-    # If PUSH_NULL was executed before loading the function, discard that sentinel
-    if frame.stack and frame.top() is NULL:
-        frame.pop()
+    candidate = frame.pop()
+
+    # If the item popped is NULL, the real callable is below it
+    if candidate is NULL:
+        callable_target = frame.pop()
+    else:
+        callable_target = candidate
+        # If NULL is directly below the callable, clean it up
+        if frame.stack and frame.top() is NULL:
+            frame.pop()
 
     frame.push(callable_target(*args))
 
