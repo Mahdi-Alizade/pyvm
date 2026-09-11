@@ -622,7 +622,7 @@ def _push_exc_info(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> 
 @VirtualMachine.register("CHECK_EXC_MATCH")
 def _check_exc_match(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     target_type = frame.pop()
-    exc = frame.top()
+    exc = frame.pop()  # Pop the tested exception copy
 
     if isinstance(exc, BaseException):
         match = isinstance(exc, target_type)
@@ -643,8 +643,12 @@ def _pop_except(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> Non
 
 @VirtualMachine.register("RERAISE")
 def _reraise(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    # In Python 3.11+, RERAISE arg indicates how deep the exception is stored
     exc = None
-    if frame.stack:
+    if instr.arg and instr.arg > 0:
+        if len(frame.stack) >= instr.arg:
+            exc = frame.stack[-instr.arg]
+    if exc is None and frame.stack:
         exc = frame.pop()
     if exc is None:
         exc = vm.exc_value
