@@ -252,10 +252,10 @@ class VirtualMachine:
                     matching_entry = entry
 
         if matching_entry is not None:
-            # Unwind stack down to entry depth
             del frame.stack[matching_entry.depth:]
             if matching_entry.lasti:
                 frame.push(current_offset)
+            self.exc_value = exc
             frame.push(exc)
             frame.ip = frame.offset_to_index[matching_entry.target] - 1
             return True
@@ -263,6 +263,7 @@ class VirtualMachine:
         if frame.block_stack:
             _, target_offset, depth = frame.block_stack.pop()
             del frame.stack[depth:]
+            self.exc_value = exc
             frame.push(exc)
             frame.ip = frame.offset_to_index[target_offset] - 1
             return True
@@ -383,11 +384,10 @@ def _delete_fast(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> No
 @VirtualMachine.register("COPY")
 def _copy(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     idx = instr.arg or 1
-    if idx > len(frame.stack):
-        # Fallback if stack unwinding aligned to top of exception
-        frame.push(frame.stack[-1] if frame.stack else vm.exc_value)
-    else:
+    if idx <= len(frame.stack):
         frame.push(frame.stack[-idx])
+    else:
+        frame.push(frame.stack[-1] if frame.stack else vm.exc_value)
 
 
 @VirtualMachine.register("SWAP")
@@ -636,15 +636,20 @@ def _check_exc_match(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -
 
 @VirtualMachine.register("POP_EXCEPT")
 def _pop_except(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
-    from_exc = frame.pop()
-    vm.exc_value = from_exc
+    if frame.stack:
+        from_exc = frame.pop()
+        vm.exc_value = from_exc
 
 
 @VirtualMachine.register("RERAISE")
 def _reraise(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
-    exc = frame.pop()
-    if frame.stack and (frame.top() is None or isinstance(frame.top(), BaseException)):
-        vm.exc_value = frame.pop()
+    exc = None
+    if frame.stack:
+        exc = frame.pop()
+    if exc is None:
+        exc = vm.exc_value
+    if exc is None:
+        raise RuntimeError("No active exception to reraise")
     raise exc
 
 
