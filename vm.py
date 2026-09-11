@@ -1,6 +1,7 @@
 """
 A modular, high-performance Python Bytecode Virtual Machine.
 Uses a direct O(1) dispatch table pattern instead of monolithic branching.
+Supports Python 3.11 - 3.13 calling conventions and data structures.
 """
 
 import builtins
@@ -59,7 +60,7 @@ class Frame:
             raise IndexError("peek from empty execution stack") from None
 
     def popn(self, n: int) -> List[Any]:
-        """Pop n items maintaining original order."""
+        """Pop n items maintaining original left-to-right order."""
         if n == 0:
             return []
         items = self.stack[-n:]
@@ -109,7 +110,6 @@ class Function:
 class VirtualMachine:
     """Execution engine with O(1) table-driven opcode dispatching."""
 
-    # Static registry of opcode handlers
     _dispatch_table: Dict[str, Callable[["VirtualMachine", Frame, dis.Instruction], Any]] = {}
 
     BINARY_OPS: Dict[str, Callable[[Any, Any], Any]] = {
@@ -174,7 +174,6 @@ class VirtualMachine:
                 if handler is None:
                     raise NotImplementedError(f"Opcode '{instr.opname}' is not supported.")
 
-                # Handlers can return a value (for RETURN_*) or modify frame.ip directly
                 result = handler(self, frame, instr)
                 if result is not None:
                     return result
@@ -186,7 +185,7 @@ class VirtualMachine:
 
 
 # ---------------------------------------------------------
-# Opcode Handlers Registration (Clean, Modular & Isolated)
+# Opcode Handlers Registration
 # ---------------------------------------------------------
 
 @VirtualMachine.register("LOAD_CONST")
@@ -307,6 +306,28 @@ def _list_append(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> No
     target_list.append(item)
 
 
+@VirtualMachine.register("SET_UPDATE")
+def _set_update(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    items = frame.pop()
+    target_set = frame.stack[-(instr.arg or 1)]
+    target_set.update(items)
+
+
+@VirtualMachine.register("MAP_ADD")
+def _map_add(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    val = frame.pop()
+    key = frame.pop()
+    target_map = frame.stack[-(instr.arg or 1)]
+    target_map[key] = val
+
+
+@VirtualMachine.register("DICT_UPDATE")
+def _dict_update(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    items = frame.pop()
+    target_dict = frame.stack[-(instr.arg or 1)]
+    target_dict.update(items)
+
+
 @VirtualMachine.register("UNARY_NEGATIVE", "UNARY_NOT", "UNARY_INVERT")
 def _unary_ops(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     val = frame.pop()
@@ -374,7 +395,7 @@ def _for_iter(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
 
 @VirtualMachine.register("END_FOR")
 def _end_for(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
-    if frame.stack and not isinstance(frame.top(), (int, float, str, dict, list)):
+    if frame.stack and not isinstance(frame.top(), (int, float, str, dict, list, set, tuple)):
         frame.pop()
 
 
@@ -393,10 +414,22 @@ def _push_null(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None
 def _call(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     argc = instr.arg or 0
     args = frame.popn(argc)
-    callable_target = frame.pop()
 
-    if frame.stack and frame.top() is NULL:
-        frame.pop()
+    item1 = frame.pop()
+
+    # In Python 3.11+, stack layout is: NULL (or self) -> callable -> args...
+    # If item1 is NULL, it means the stack was misaligned or NULL was placed on top;
+    # otherwise item1 is the callable target, and NULL (or self) sits beneath it.
+    if item1 is NULL:
+        callable_target = frame.pop()
+        self_or_null = None
+    else:
+        callable_target = item1
+        self_or_null = frame.pop() if frame.stack else None
+
+    # If self_or_null is a bound receiver (not NULL), prepend it to args
+    if self_or_null is not None and self_or_null is not NULL:
+        args.insert(0, self_or_null)
 
     frame.push(callable_target(*args))
 
