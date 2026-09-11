@@ -1,63 +1,114 @@
 """
-A lightweight Python Bytecode Virtual Machine implemented in pure Python.
+A robust, frame-based Python Bytecode Virtual Machine implemented in pure Python.
+Supports Python 3.11 - 3.13 bytecode conventions.
 """
 
 import builtins
 import dis
 import types
-from typing import Any, List, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
-class Function:
-    """Represents a user-defined function inside the custom Virtual Machine."""
+class _NullSentinel:
+    """Represents the NULL pushed by PUSH_NULL in modern CPython frames."""
+    def __repr__(self) -> str:
+        return "<NULL>"
 
-    def __init__(self, code_obj: types.CodeType, vm: "VirtualMachine", name: Optional[str] = None) -> None:
+
+NULL = _NullSentinel()
+
+
+class Frame:
+    """
+    Represents an isolated call frame containing its own stack,
+    instruction pointer, locals, and reference to globals.
+    """
+
+    def __init__(
+        self,
+        code_obj: types.CodeType,
+        globals_scope: Dict[str, Any],
+        locals_scope: Dict[str, Any],
+        builtins_scope: Dict[str, Any],
+    ) -> None:
         self.code_obj = code_obj
-        self.vm = vm
-        self.name = name or code_obj.co_name
-
-    def __call__(self, *args: Any) -> Any:
-        # Bind incoming arguments to local variable names defined in code_obj
-        local_env: Dict[str, Any] = {}
-        for var_name, arg_val in zip(self.code_obj.co_varnames, args):
-            local_env[var_name] = arg_val
-
-        # Execute function body in its own isolated frame
-        return self.vm.run_code(self.code_obj, local_env=local_env)
-
-
-class VirtualMachine:
-    """
-    Core Stack-based Virtual Machine capable of executing Python code objects.
-    """
-
-    def __init__(self) -> None:
+        self.globals: Dict[str, Any] = globals_scope
+        self.locals: Dict[str, Any] = locals_scope
+        self.builtins: Dict[str, Any] = builtins_scope
         self.stack: List[Any] = []
-        self.globals: Dict[str, Any] = {}
-        # Safely extract builtins namespace whether it is a module or dict
-        if isinstance(builtins, dict):
-            self.builtins: Dict[str, Any] = builtins
-        else:
-            self.builtins: Dict[str, Any] = builtins.__dict__
+        self.instructions: List[dis.Instruction] = list(dis.get_instructions(code_obj))
+        self.offset_to_index: Dict[int, int] = {
+            instr.offset: idx for idx, instr in enumerate(self.instructions)
+        }
+        self.ip: int = 0
 
     def push(self, value: Any) -> None:
-        """Push a value onto the execution stack."""
         self.stack.append(value)
 
     def pop(self) -> Any:
-        """Pop and return the top value from the execution stack."""
         if not self.stack:
             raise IndexError("pop from empty execution stack")
         return self.stack.pop()
 
     def top(self) -> Any:
-        """Peek at the top value of the stack without removing it."""
         if not self.stack:
             raise IndexError("peek from empty execution stack")
         return self.stack[-1]
 
+
+class Function:
+    """Represents a callable function inside the custom Virtual Machine."""
+
+    def __init__(
+        self,
+        code_obj: types.CodeType,
+        vm: "VirtualMachine",
+        name: Optional[str] = None,
+        defaults: tuple = (),
+    ) -> None:
+        self.code_obj = code_obj
+        self.vm = vm
+        self.name = name or code_obj.co_name
+        self.defaults = defaults
+
+    def __call__(self, *args: Any) -> Any:
+        local_env: Dict[str, Any] = {}
+
+        # Bind default arguments first
+        arg_names = self.code_obj.co_varnames[: self.code_obj.co_argcount]
+        if self.defaults:
+            offset = len(arg_names) - len(self.defaults)
+            for idx, default_val in enumerate(self.defaults):
+                local_env[arg_names[offset + idx]] = default_val
+
+        # Bind positional arguments
+        for var_name, arg_val in zip(arg_names, args):
+            local_env[var_name] = arg_val
+
+        frame = Frame(
+            code_obj=self.code_obj,
+            globals_scope=self.vm.globals,
+            locals_scope=local_env,
+            builtins_scope=self.vm.builtins,
+        )
+        return self.vm.run_frame(frame)
+
+
+class VirtualMachine:
+    """
+    Stack-based Virtual Machine capable of executing Python bytecode
+    using frame-isolated stacks.
+    """
+
+    def __init__(self) -> None:
+        self.globals: Dict[str, Any] = {}
+        if isinstance(builtins, dict):
+            self.builtins: Dict[str, Any] = builtins
+        else:
+            self.builtins: Dict[str, Any] = builtins.__dict__
+        self.frames: List[Frame] = []
+
     def _eval_compare(self, left: Any, right: Any, raw_op: str) -> bool:
-        """Evaluate comparison operation cleanly across different Python version dis formats."""
         op = raw_op.replace("bool(", "").replace(")", "").strip()
 
         if op == "==":
@@ -81,198 +132,280 @@ class VirtualMachine:
         elif op in ("is not", "IS_NOT"):
             return left is not right
         else:
-            raise NotImplementedError(f"Unsupported comparison symbol: '{raw_op}' (parsed as '{op}')")
+            raise NotImplementedError(f"Unsupported comparison operator: '{raw_op}'")
 
-    def run_code(self, code_obj: types.CodeType, local_env: Optional[Dict[str, Any]] = None) -> Any:
-        """
-        Disassemble and execute a Python code object instruction by instruction.
-        """
+    def run_code(
+        self, code_obj: types.CodeType, local_env: Optional[Dict[str, Any]] = None
+    ) -> Any:
         locals_scope = local_env if local_env is not None else self.globals
-        instructions = list(dis.get_instructions(code_obj))
-        offset_to_index = {instr.offset: idx for idx, instr in enumerate(instructions)}
+        frame = Frame(
+            code_obj=code_obj,
+            globals_scope=self.globals,
+            locals_scope=locals_scope,
+            builtins_scope=self.builtins,
+        )
+        return self.run_frame(frame)
 
-        instruction_pointer = 0
+    def run_frame(self, frame: Frame) -> Any:
+        self.frames.append(frame)
 
-        while instruction_pointer < len(instructions):
-            instr = instructions[instruction_pointer]
-            opname = instr.opname
-            argval = instr.argval
-            jump_taken = False
+        try:
+            while frame.ip < len(frame.instructions):
+                instr = frame.instructions[frame.ip]
+                opname = instr.opname
+                argval = instr.argval
+                jump_taken = False
 
-            # Opcode: Load Constant
-            if opname == "LOAD_CONST":
-                self.push(argval)
+                # Constants
+                if opname == "LOAD_CONST":
+                    frame.push(argval)
 
-            # Opcode: Load Global / Builtin Variable
-            elif opname == "LOAD_GLOBAL":
-                if argval in self.globals:
-                    self.push(self.globals[argval])
-                elif argval in self.builtins:
-                    self.push(self.builtins[argval])
-                else:
-                    raise NameError(f"global name '{argval}' is not defined")
+                # Scope: Globals & Builtins
+                elif opname == "LOAD_GLOBAL":
+                    if argval in frame.globals:
+                        frame.push(frame.globals[argval])
+                    elif argval in frame.builtins:
+                        frame.push(frame.builtins[argval])
+                    else:
+                        raise NameError(f"global name '{argval}' is not defined")
 
-            elif opname == "STORE_GLOBAL":
-                val = self.pop()
-                self.globals[argval] = val
+                elif opname == "STORE_GLOBAL":
+                    frame.globals[argval] = frame.pop()
 
-            # Opcode: Load / Store Name (Module-level Scope)
-            elif opname == "LOAD_NAME":
-                if argval in locals_scope:
-                    self.push(locals_scope[argval])
-                elif argval in self.globals:
-                    self.push(self.globals[argval])
-                elif argval in self.builtins:
-                    self.push(self.builtins[argval])
-                else:
-                    raise NameError(f"name '{argval}' is not defined")
+                # Scope: Names
+                elif opname == "LOAD_NAME":
+                    if argval in frame.locals:
+                        frame.push(frame.locals[argval])
+                    elif argval in frame.globals:
+                        frame.push(frame.globals[argval])
+                    elif argval in frame.builtins:
+                        frame.push(frame.builtins[argval])
+                    else:
+                        raise NameError(f"name '{argval}' is not defined")
 
-            elif opname == "STORE_NAME":
-                val = self.pop()
-                locals_scope[argval] = val
+                elif opname == "STORE_NAME":
+                    frame.locals[argval] = frame.pop()
 
-            # Opcode: Fast Local Variable Access (Function Scope)
-            elif opname == "LOAD_FAST":
-                if argval in locals_scope:
-                    self.push(locals_scope[argval])
-                elif argval in self.globals:
-                    self.push(self.globals[argval])
-                elif argval in self.builtins:
-                    self.push(self.builtins[argval])
-                else:
-                    raise UnboundLocalError(f"local variable '{argval}' referenced before assignment")
+                # Scope: Locals (Fast)
+                elif opname == "LOAD_FAST":
+                    if argval in frame.locals:
+                        frame.push(frame.locals[argval])
+                    else:
+                        raise UnboundLocalError(
+                            f"local variable '{argval}' referenced before assignment"
+                        )
 
-            elif opname == "STORE_FAST":
-                val = self.pop()
-                locals_scope[argval] = val
+                elif opname == "STORE_FAST":
+                    frame.locals[argval] = frame.pop()
 
-            # Opcode: Create Custom Function Object
-            elif opname == "MAKE_FUNCTION":
-                # In modern Python, code object is pushed right before MAKE_FUNCTION
-                code_target = self.pop()
-                func_instance = Function(code_target, self)
-                self.push(func_instance)
+                # Attributes
+                elif opname == "LOAD_ATTR":
+                    owner = frame.pop()
+                    attr_name = argval if isinstance(argval, str) else instr.argrepr
+                    frame.push(getattr(owner, attr_name))
 
-            # Opcode: Build and Manipulate List
-            elif opname == "BUILD_LIST":
-                count = instr.arg if instr.arg is not None else 0
-                items = [self.pop() for _ in range(count)]
-                items.reverse()
-                self.push(items)
+                elif opname == "STORE_ATTR":
+                    val = frame.pop()
+                    owner = frame.pop()
+                    attr_name = argval if isinstance(argval, str) else instr.argrepr
+                    setattr(owner, attr_name, val)
 
-            elif opname == "LIST_EXTEND":
-                i = instr.arg if instr.arg is not None else 1
-                items_to_extend = self.pop()
-                target_list = self.stack[-i]
-                target_list.extend(items_to_extend)
+                # Subscripting & Slicing
+                elif opname == "BINARY_SUBSCR":
+                    sub = frame.pop()
+                    container = frame.pop()
+                    frame.push(container[sub])
 
-            elif opname == "LIST_APPEND":
-                i = instr.arg if instr.arg is not None else 1
-                item_to_append = self.pop()
-                target_list = self.stack[-i]
-                target_list.append(item_to_append)
+                elif opname == "STORE_SUBSCR":
+                    sub = frame.pop()
+                    container = frame.pop()
+                    val = frame.pop()
+                    container[sub] = val
 
-            # Opcode: Binary Arithmetic Operations
-            elif opname in ("BINARY_OP", "BINARY_ADD", "BINARY_SUBTRACT", "BINARY_MULTIPLY", "BINARY_TRUE_DIVIDE"):
-                right = self.pop()
-                left = self.pop()
+                # Data Structures
+                elif opname == "BUILD_LIST":
+                    count = instr.arg if instr.arg is not None else 0
+                    items = [frame.pop() for _ in range(count)]
+                    items.reverse()
+                    frame.push(items)
 
-                if opname == "BINARY_ADD" or instr.argrepr == "+":
-                    self.push(left + right)
-                elif opname == "BINARY_SUBTRACT" or instr.argrepr == "-":
-                    self.push(left - right)
-                elif opname == "BINARY_MULTIPLY" or instr.argrepr == "*":
-                    self.push(left * right)
-                elif opname == "BINARY_TRUE_DIVIDE" or instr.argrepr == "/":
-                    self.push(left / right)
-                elif instr.argrepr == "%":
-                    self.push(left % right)
-                else:
-                    raise NotImplementedError(f"Unsupported binary operator: {instr.argrepr}")
+                elif opname == "BUILD_MAP":
+                    count = instr.arg if instr.arg is not None else 0
+                    mapping: Dict[Any, Any] = {}
+                    pairs = [frame.pop() for _ in range(count * 2)]
+                    pairs.reverse()
+                    for idx in range(0, len(pairs), 2):
+                        mapping[pairs[idx]] = pairs[idx + 1]
+                    frame.push(mapping)
 
-            # Opcode: Comparison Operations
-            elif opname == "COMPARE_OP":
-                right = self.pop()
-                left = self.pop()
-                result = self._eval_compare(left, right, instr.argrepr)
-                self.push(result)
+                elif opname == "BUILD_TUPLE":
+                    count = instr.arg if instr.arg is not None else 0
+                    items = [frame.pop() for _ in range(count)]
+                    items.reverse()
+                    frame.push(tuple(items))
 
-            # Opcode: Unconditional Jumps
-            elif opname in ("JUMP_FORWARD", "JUMP_BACKWARD", "JUMP_ABSOLUTE"):
-                target_offset = instr.argval
-                instruction_pointer = offset_to_index[target_offset]
-                jump_taken = True
+                elif opname == "BUILD_SET":
+                    count = instr.arg if instr.arg is not None else 0
+                    items = [frame.pop() for _ in range(count)]
+                    frame.push(set(items))
 
-            # Opcode: Conditional Jumps
-            elif opname in ("POP_JUMP_IF_FALSE", "POP_JUMP_FORWARD_IF_FALSE", "POP_JUMP_BACKWARD_IF_FALSE"):
-                val = self.pop()
-                if not bool(val):
-                    target_offset = instr.argval
-                    instruction_pointer = offset_to_index[target_offset]
+                elif opname == "LIST_EXTEND":
+                    i = instr.arg if instr.arg is not None else 1
+                    items_to_extend = frame.pop()
+                    target_list = frame.stack[-i]
+                    target_list.extend(items_to_extend)
+
+                elif opname == "LIST_APPEND":
+                    i = instr.arg if instr.arg is not None else 1
+                    item_to_append = frame.pop()
+                    target_list = frame.stack[-i]
+                    target_list.append(item_to_append)
+
+                # Arithmetic & Unary
+                elif opname == "UNARY_NEGATIVE":
+                    frame.push(-frame.pop())
+
+                elif opname == "UNARY_NOT":
+                    frame.push(not frame.pop())
+
+                elif opname == "UNARY_INVERT":
+                    frame.push(~frame.pop())
+
+                elif opname in (
+                    "BINARY_OP",
+                    "BINARY_ADD",
+                    "BINARY_SUBTRACT",
+                    "BINARY_MULTIPLY",
+                    "BINARY_TRUE_DIVIDE",
+                    "BINARY_FLOOR_DIVIDE",
+                    "BINARY_MODULO",
+                    "BINARY_POWER",
+                ):
+                    right = frame.pop()
+                    left = frame.pop()
+                    sym = instr.argrepr.replace("=", "").strip()
+
+                    if opname == "BINARY_ADD" or sym == "+":
+                        frame.push(left + right)
+                    elif opname == "BINARY_SUBTRACT" or sym == "-":
+                        frame.push(left - right)
+                    elif opname == "BINARY_MULTIPLY" or sym == "*":
+                        frame.push(left * right)
+                    elif opname == "BINARY_TRUE_DIVIDE" or sym == "/":
+                        frame.push(left / right)
+                    elif opname == "BINARY_FLOOR_DIVIDE" or sym == "//":
+                        frame.push(left // right)
+                    elif opname == "BINARY_MODULO" or sym == "%":
+                        frame.push(left % right)
+                    elif opname == "BINARY_POWER" or sym == "**":
+                        frame.push(left ** right)
+                    elif sym == "&":
+                        frame.push(left & right)
+                    elif sym == "|":
+                        frame.push(left | right)
+                    elif sym == "^":
+                        frame.push(left ^ right)
+                    elif sym == "<<":
+                        frame.push(left << right)
+                    elif sym == ">>":
+                        frame.push(left >> right)
+                    else:
+                        raise NotImplementedError(f"Unsupported binary operation: {instr.argrepr}")
+
+                # Comparisons
+                elif opname == "COMPARE_OP":
+                    right = frame.pop()
+                    left = frame.pop()
+                    frame.push(self._eval_compare(left, right, instr.argrepr))
+
+                # Control Flow & Jumps
+                elif opname in ("JUMP_FORWARD", "JUMP_BACKWARD", "JUMP_ABSOLUTE"):
+                    frame.ip = frame.offset_to_index[instr.argval]
                     jump_taken = True
 
-            elif opname in ("POP_JUMP_IF_TRUE", "POP_JUMP_FORWARD_IF_TRUE", "POP_JUMP_BACKWARD_IF_TRUE"):
-                val = self.pop()
-                if bool(val):
-                    target_offset = instr.argval
-                    instruction_pointer = offset_to_index[target_offset]
-                    jump_taken = True
+                elif opname in (
+                    "POP_JUMP_IF_FALSE",
+                    "POP_JUMP_FORWARD_IF_FALSE",
+                    "POP_JUMP_BACKWARD_IF_FALSE",
+                ):
+                    val = frame.pop()
+                    if not bool(val):
+                        frame.ip = frame.offset_to_index[instr.argval]
+                        jump_taken = True
 
-            # Opcode: Iterators & For Loops
-            elif opname == "GET_ITER":
-                iterable = self.pop()
-                self.push(iter(iterable))
+                elif opname in (
+                    "POP_JUMP_IF_TRUE",
+                    "POP_JUMP_FORWARD_IF_TRUE",
+                    "POP_JUMP_BACKWARD_IF_TRUE",
+                ):
+                    val = frame.pop()
+                    if bool(val):
+                        frame.ip = frame.offset_to_index[instr.argval]
+                        jump_taken = True
 
-            elif opname in ("FOR_ITER", "FOR_ITER_GEN"):
-                iterator = self.top()
-                try:
-                    next_value = next(iterator)
-                    self.push(next_value)
-                except StopIteration:
-                    self.pop()
-                    target_offset = instr.argval
-                    instruction_pointer = offset_to_index[target_offset]
-                    jump_taken = True
+                # Iterators
+                elif opname == "GET_ITER":
+                    frame.push(iter(frame.pop()))
 
-            elif opname == "END_FOR":
-                if self.stack:
-                    self.pop()
+                elif opname in ("FOR_ITER", "FOR_ITER_GEN"):
+                    iterator = frame.top()
+                    try:
+                        frame.push(next(iterator))
+                    except StopIteration:
+                        frame.pop()
+                        frame.ip = frame.offset_to_index[instr.argval]
+                        jump_taken = True
 
-            # Opcode: Function Call
-            elif opname in ("CALL", "CALL_FUNCTION"):
-                argc = instr.arg if instr.arg is not None else 0
-                args = [self.pop() for _ in range(argc)]
-                args.reverse()
+                elif opname == "END_FOR":
+                    if frame.stack and not isinstance(frame.top(), (int, float, str, dict, list)):
+                        frame.pop()
 
-                func = self.pop()
-                result = func(*args)
-                self.push(result)
+                # Functions & Calls
+                elif opname == "MAKE_FUNCTION":
+                    code_target = frame.pop()
+                    func_obj = Function(code_target, self)
+                    frame.push(func_obj)
 
-            # Opcode: Push NULL before callable (Python 3.11+ requirement)
-            elif opname == "PUSH_NULL":
-                pass
+                elif opname == "PUSH_NULL":
+                    frame.push(NULL)
 
-            # Opcode: Pop Top (Discard value)
-            elif opname == "POP_TOP":
-                if self.stack:
-                    self.pop()
+                elif opname in ("CALL", "CALL_FUNCTION"):
+                    argc = instr.arg if instr.arg is not None else 0
+                    args = [frame.pop() for _ in range(argc)]
+                    args.reverse()
 
-            # Opcode: Return Constant (Python 3.12+ optimization)
-            elif opname == "RETURN_CONST":
-                return argval
+                    callable_target = frame.pop()
 
-            # Opcode: Return Value
-            elif opname == "RETURN_VALUE":
-                return self.pop() if self.stack else None
+                    # Discard NULL prefix if placed by PUSH_NULL
+                    if frame.stack and frame.top() is NULL:
+                        frame.pop()
 
-            # Opcode: Resume and administrative opcodes
-            elif opname in ("RESUME", "NOP", "PRECALL"):
-                pass
+                    result = callable_target(*args)
+                    frame.push(result)
 
-            else:
-                raise NotImplementedError(f"Opcode '{opname}' is not yet supported in this VM.")
+                # Returns & Cleanup
+                elif opname == "RETURN_CONST":
+                    return argval
 
-            if not jump_taken:
-                instruction_pointer += 1
+                elif opname == "RETURN_VALUE":
+                    return frame.pop() if frame.stack else None
+
+                elif opname == "POP_TOP":
+                    if frame.stack:
+                        frame.pop()
+
+                elif opname in ("RESUME", "NOP", "PRECALL", "CACHE"):
+                    pass
+
+                else:
+                    raise NotImplementedError(
+                        f"Opcode '{opname}' (arg={instr.arg}, argval={instr.argval}) is not supported."
+                    )
+
+                if not jump_taken:
+                    frame.ip += 1
+
+        finally:
+            self.frames.pop()
 
         return None
