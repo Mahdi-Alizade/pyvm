@@ -189,7 +189,7 @@ class VirtualMachine:
     """Execution engine with indexed numeric opcode array dispatching."""
 
     _dispatch_table: Dict[str, Callable[["VirtualMachine", Frame, dis.Instruction], Any]] = {}
-    _opcode_array: List[Optional[Callable[["VirtualMachine", Frame, dis.Instruction], Any]]] = [None] * 256
+    _opcode_array: List[Optional[Callable[["VirtualMachine", Frame, dis.Instruction], Any]]] = [None] * 512
 
     BINARY_OPS: Dict[str, Callable[[Any, Any], Any]] = {
         "+": operator.add,
@@ -226,7 +226,9 @@ class VirtualMachine:
             for op in opnames:
                 cls._dispatch_table[op] = func
                 if hasattr(dis, "opmap") and op in dis.opmap:
-                    cls._opcode_array[dis.opmap[op]] = func
+                    code_val = dis.opmap[op]
+                    if code_val < len(cls._opcode_array):
+                        cls._opcode_array[code_val] = func
             return func
         return decorator
 
@@ -278,13 +280,14 @@ class VirtualMachine:
         self.frames.append(frame)
         opcode_array = self._opcode_array
         dispatch_table = self._dispatch_table
+        array_len = len(opcode_array)
 
         try:
             while frame.ip < len(frame.instructions):
                 instr = frame.instructions[frame.ip]
 
                 # Fast path: numeric index lookup in opcode array
-                handler = opcode_array[instr.opcode]
+                handler = opcode_array[instr.opcode] if instr.opcode < array_len else None
                 if handler is None:
                     # Fallback path: dictionary lookup by opcode name
                     handler = dispatch_table.get(instr.opname)
@@ -506,17 +509,16 @@ def _dict_update(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> No
 @VirtualMachine.register("FORMAT_VALUE")
 def _format_value(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     """Format single expression value for f-strings."""
-    # instr.arg format spec flags: 0x04 indicates format specifier string is on stack
     has_spec = bool((instr.arg or 0) & 0x04)
     format_spec = frame.pop() if has_spec else ""
     val = frame.pop()
 
     conversion = (instr.arg or 0) & 0x03
-    if conversion == 0x01:  # str()
+    if conversion == 0x01:
         val = str(val)
-    elif conversion == 0x02:  # repr()
+    elif conversion == 0x02:
         val = repr(val)
-    elif conversion == 0x03:  # ascii()
+    elif conversion == 0x03:
         val = ascii(val)
 
     frame.push(format(val, format_spec))
@@ -630,7 +632,6 @@ def _call(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
         if frame.stack and frame.top() is NULL:
             frame.pop()
     else:
-        # Method invocation where receiver self is popped first and callable sits underneath
         args.insert(0, candidate)
         callable_target = frame.pop()
         if frame.stack and frame.top() is NULL:
