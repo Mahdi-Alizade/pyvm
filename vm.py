@@ -1,7 +1,7 @@
 """
 A modular, high-performance Python Bytecode Virtual Machine.
 Uses an indexed O(1) opcode array dispatch pattern, isolated frame stacks,
-native Exception Table unwinding, Context Manager support, and modern string formatting.
+pre-resolved jump targets, native Exception Table unwinding, and Context Manager support.
 Compatible with Python 3.11 - 3.13.
 """
 
@@ -30,6 +30,20 @@ class ExceptionTableEntry(NamedTuple):
     target: int
     depth: int
     lasti: bool
+
+
+class VMInstruction:
+    """Optimized wrapper around dis.Instruction with pre-resolved jump targets."""
+    __slots__ = ("opcode", "opname", "arg", "argval", "argrepr", "offset", "target_ip")
+
+    def __init__(self, instr: dis.Instruction, target_ip: int = -1) -> None:
+        self.opcode: int = instr.opcode
+        self.opname: str = instr.opname
+        self.arg: Optional[int] = instr.arg
+        self.argval: Any = instr.argval
+        self.argrepr: str = instr.argrepr
+        self.offset: int = instr.offset
+        self.target_ip: int = target_ip
 
 
 def _parse_exception_table(code_obj: types.CodeType) -> List[ExceptionTableEntry]:
@@ -77,14 +91,24 @@ def _parse_exception_table(code_obj: types.CodeType) -> List[ExceptionTableEntry
 
 
 # Cache disassembled instructions, offsets, and exception tables per code object
-_CODE_CACHE: Dict[types.CodeType, Tuple[List[dis.Instruction], Dict[int, int], List[ExceptionTableEntry]]] = {}
+_CODE_CACHE: Dict[types.CodeType, Tuple[List[VMInstruction], Dict[int, int], List[ExceptionTableEntry]]] = {}
 
 
-def _get_cached_code_data(code_obj: types.CodeType) -> Tuple[List[dis.Instruction], Dict[int, int], List[ExceptionTableEntry]]:
+def _get_cached_code_data(code_obj: types.CodeType) -> Tuple[List[VMInstruction], Dict[int, int], List[ExceptionTableEntry]]:
     if code_obj not in _CODE_CACHE:
-        instructions = list(dis.get_instructions(code_obj))
-        offset_map = {instr.offset: idx for idx, instr in enumerate(instructions)}
+        raw_instructions = list(dis.get_instructions(code_obj))
+        offset_map = {instr.offset: idx for idx, instr in enumerate(raw_instructions)}
         exc_entries = _parse_exception_table(code_obj)
+
+        # Pre-resolve jump targets to instruction indices
+        instructions: List[VMInstruction] = []
+        for instr in raw_instructions:
+            target_ip = -1
+            if instr.is_jump_target or "JUMP" in instr.opname or instr.opname in ("FOR_ITER", "FOR_ITER_GEN", "SETUP_FINALLY"):
+                if isinstance(instr.argval, int) and instr.argval in offset_map:
+                    target_ip = offset_map[instr.argval]
+            instructions.append(VMInstruction(instr, target_ip))
+
         _CODE_CACHE[code_obj] = (instructions, offset_map, exc_entries)
     return _CODE_CACHE[code_obj]
 
@@ -186,10 +210,12 @@ class Function:
 
 
 class VirtualMachine:
-    """Execution engine with indexed numeric opcode array dispatching."""
+    """Execution engine with indexed numeric opcode array dispatching and fast pre-resolved jumps."""
 
-    _dispatch_table: Dict[str, Callable[["VirtualMachine", Frame, dis.Instruction], Any]] = {}
-    _opcode_array: List[Optional[Callable[["VirtualMachine", Frame, dis.Instruction], Any]]] = [None] * 512
+    __slots__ = ("globals", "builtins", "frames", "exc_value")
+
+    _dispatch_table: Dict[str, Callable[["VirtualMachine", Frame, VMInstruction], Any]] = {}
+    _opcode_array: List[Optional[Callable[["VirtualMachine", Frame, VMInstruction], Any]]] = [None] * 512
 
     BINARY_OPS: Dict[str, Callable[[Any, Any], Any]] = {
         "+": operator.add,
@@ -222,7 +248,7 @@ class VirtualMachine:
     @classmethod
     def register(cls, *opnames: str):
         """Decorator to map opcodes into the dispatch table and numerical opcode array."""
-        def decorator(func: Callable[["VirtualMachine", Frame, dis.Instruction], Any]):
+        def decorator(func: Callable[["VirtualMachine", Frame, VMInstruction], Any]):
             for op in opnames:
                 cls._dispatch_table[op] = func
                 if hasattr(dis, "opmap") and op in dis.opmap:
@@ -286,10 +312,9 @@ class VirtualMachine:
             while frame.ip < len(frame.instructions):
                 instr = frame.instructions[frame.ip]
 
-                # Fast path: numeric index lookup in opcode array
+                # Direct O(1) integer dispatch
                 handler = opcode_array[instr.opcode] if instr.opcode < array_len else None
                 if handler is None:
-                    # Fallback path: dictionary lookup by opcode name
                     handler = dispatch_table.get(instr.opname)
                     if handler is None:
                         raise NotImplementedError(f"Opcode '{instr.opname}' (code={instr.opcode}) is not supported.")
@@ -314,12 +339,12 @@ class VirtualMachine:
 # ---------------------------------------------------------
 
 @VirtualMachine.register("LOAD_CONST")
-def _load_const(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _load_const(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     frame.push(instr.argval)
 
 
 @VirtualMachine.register("LOAD_GLOBAL")
-def _load_global(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _load_global(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     name = instr.argval
     if name in frame.globals:
         frame.push(frame.globals[name])
@@ -330,12 +355,12 @@ def _load_global(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> No
 
 
 @VirtualMachine.register("STORE_GLOBAL")
-def _store_global(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _store_global(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     frame.globals[instr.argval] = frame.pop()
 
 
 @VirtualMachine.register("DELETE_GLOBAL")
-def _delete_global(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _delete_global(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     name = instr.argval
     if name in frame.globals:
         del frame.globals[name]
@@ -344,7 +369,7 @@ def _delete_global(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> 
 
 
 @VirtualMachine.register("LOAD_NAME")
-def _load_name(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _load_name(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     name = instr.argval
     if name in frame.locals:
         frame.push(frame.locals[name])
@@ -357,12 +382,12 @@ def _load_name(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None
 
 
 @VirtualMachine.register("STORE_NAME")
-def _store_name(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _store_name(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     frame.locals[instr.argval] = frame.pop()
 
 
 @VirtualMachine.register("DELETE_NAME")
-def _delete_name(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _delete_name(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     name = instr.argval
     if name in frame.locals:
         del frame.locals[name]
@@ -373,7 +398,7 @@ def _delete_name(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> No
 
 
 @VirtualMachine.register("LOAD_FAST")
-def _load_fast(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _load_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     name = instr.argval
     if name in frame.locals:
         frame.push(frame.locals[name])
@@ -382,12 +407,12 @@ def _load_fast(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None
 
 
 @VirtualMachine.register("STORE_FAST")
-def _store_fast(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _store_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     frame.locals[instr.argval] = frame.pop()
 
 
 @VirtualMachine.register("DELETE_FAST")
-def _delete_fast(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _delete_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     name = instr.argval
     if name in frame.locals:
         del frame.locals[name]
@@ -396,7 +421,7 @@ def _delete_fast(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> No
 
 
 @VirtualMachine.register("COPY")
-def _copy(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _copy(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     idx = instr.arg or 1
     if idx <= len(frame.stack):
         frame.push(frame.stack[-idx])
@@ -405,21 +430,21 @@ def _copy(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
 
 
 @VirtualMachine.register("SWAP")
-def _swap(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _swap(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     idx = instr.arg or 2
     if idx <= len(frame.stack):
         frame.stack[-1], frame.stack[-idx] = frame.stack[-idx], frame.stack[-1]
 
 
 @VirtualMachine.register("LOAD_ATTR")
-def _load_attr(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _load_attr(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     owner = frame.pop()
     attr = instr.argval if isinstance(instr.argval, str) else instr.argrepr
     frame.push(getattr(owner, attr))
 
 
 @VirtualMachine.register("STORE_ATTR")
-def _store_attr(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _store_attr(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     val = frame.pop()
     owner = frame.pop()
     attr = instr.argval if isinstance(instr.argval, str) else instr.argrepr
@@ -427,43 +452,43 @@ def _store_attr(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> Non
 
 
 @VirtualMachine.register("BINARY_SUBSCR")
-def _binary_subscr(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _binary_subscr(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     sub = frame.pop()
     container = frame.pop()
     frame.push(container[sub])
 
 
 @VirtualMachine.register("STORE_SUBSCR")
-def _store_subscr(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _store_subscr(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     sub = frame.pop()
     container = frame.pop()
     container[sub] = frame.pop()
 
 
 @VirtualMachine.register("BUILD_LIST")
-def _build_list(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _build_list(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     frame.push(frame.popn(instr.arg or 0))
 
 
 @VirtualMachine.register("BUILD_TUPLE")
-def _build_tuple(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _build_tuple(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     frame.push(tuple(frame.popn(instr.arg or 0)))
 
 
 @VirtualMachine.register("BUILD_SET")
-def _build_set(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _build_set(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     frame.push(set(frame.popn(instr.arg or 0)))
 
 
 @VirtualMachine.register("BUILD_MAP")
-def _build_map(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _build_map(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     count = instr.arg or 0
     items = frame.popn(count * 2)
     frame.push({items[i]: items[i + 1] for i in range(0, len(items), 2)})
 
 
 @VirtualMachine.register("BUILD_CONST_KEY_MAP")
-def _build_const_key_map(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _build_const_key_map(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     keys = frame.pop()
     count = len(keys)
     values = frame.popn(count)
@@ -471,28 +496,28 @@ def _build_const_key_map(vm: VirtualMachine, frame: Frame, instr: dis.Instructio
 
 
 @VirtualMachine.register("LIST_EXTEND")
-def _list_extend(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _list_extend(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     items = frame.pop()
     target_list = frame.stack[-(instr.arg or 1)]
     target_list.extend(items)
 
 
 @VirtualMachine.register("LIST_APPEND")
-def _list_append(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _list_append(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     item = frame.pop()
     target_list = frame.stack[-(instr.arg or 1)]
     target_list.append(item)
 
 
 @VirtualMachine.register("SET_UPDATE")
-def _set_update(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _set_update(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     items = frame.pop()
     target_set = frame.stack[-(instr.arg or 1)]
     target_set.update(items)
 
 
 @VirtualMachine.register("MAP_ADD")
-def _map_add(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _map_add(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     val = frame.pop()
     key = frame.pop()
     target_map = frame.stack[-(instr.arg or 1)]
@@ -500,21 +525,21 @@ def _map_add(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
 
 
 @VirtualMachine.register("DICT_UPDATE")
-def _dict_update(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _dict_update(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     items = frame.pop()
     target_dict = frame.stack[-(instr.arg or 1)]
     target_dict.update(items)
 
 
 @VirtualMachine.register("FORMAT_SIMPLE")
-def _format_simple(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
-    """Fast-path string conversion for f-strings introduced in Python 3.13."""
+def _format_simple(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    """Fast-path string conversion for f-strings in Python 3.13."""
     val = frame.pop()
     frame.push(str(val))
 
 
 @VirtualMachine.register("CONVERT_VALUE")
-def _convert_value(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _convert_value(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     """Format conversion flag implementation (!s, !r, !a) for f-strings."""
     val = frame.pop()
     conv = instr.arg or 1
@@ -529,7 +554,7 @@ def _convert_value(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> 
 
 
 @VirtualMachine.register("FORMAT_VALUE")
-def _format_value(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _format_value(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     """Format single expression value for f-strings."""
     has_spec = bool((instr.arg or 0) & 0x04)
     format_spec = frame.pop() if has_spec else ""
@@ -547,7 +572,7 @@ def _format_value(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> N
 
 
 @VirtualMachine.register("BUILD_STRING")
-def _build_string(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _build_string(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     """Concatenate n strings from the stack into one string."""
     count = instr.arg or 0
     items = frame.popn(count)
@@ -555,12 +580,12 @@ def _build_string(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> N
 
 
 @VirtualMachine.register("UNARY_POSITIVE")
-def _unary_positive(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _unary_positive(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     frame.push(+frame.pop())
 
 
 @VirtualMachine.register("UNARY_NEGATIVE", "UNARY_NOT", "UNARY_INVERT")
-def _unary_ops(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _unary_ops(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     val = frame.pop()
     if instr.opname == "UNARY_NEGATIVE":
         frame.push(-val)
@@ -571,7 +596,7 @@ def _unary_ops(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None
 
 
 @VirtualMachine.register("BINARY_OP", "BINARY_ADD", "BINARY_SUBTRACT", "BINARY_MULTIPLY", "BINARY_TRUE_DIVIDE")
-def _binary_ops(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _binary_ops(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     right = frame.pop()
     left = frame.pop()
     sym = instr.argrepr.replace("=", "").strip()
@@ -582,7 +607,7 @@ def _binary_ops(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> Non
 
 
 @VirtualMachine.register("COMPARE_OP")
-def _compare_op(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _compare_op(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     right = frame.pop()
     left = frame.pop()
     raw = instr.argrepr.replace("bool(", "").replace(")", "").strip()
@@ -593,56 +618,69 @@ def _compare_op(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> Non
 
 
 @VirtualMachine.register("JUMP_FORWARD", "JUMP_BACKWARD", "JUMP_ABSOLUTE")
-def _jump(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
-    frame.ip = frame.offset_to_index[instr.argval] - 1
+def _jump(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    # Use pre-resolved target_ip if available for O(1) jump
+    if instr.target_ip != -1:
+        frame.ip = instr.target_ip - 1
+    else:
+        frame.ip = frame.offset_to_index[instr.argval] - 1
 
 
 @VirtualMachine.register("POP_JUMP_IF_FALSE", "POP_JUMP_FORWARD_IF_FALSE", "POP_JUMP_BACKWARD_IF_FALSE")
-def _jump_if_false(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _jump_if_false(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     if not bool(frame.pop()):
-        frame.ip = frame.offset_to_index[instr.argval] - 1
+        if instr.target_ip != -1:
+            frame.ip = instr.target_ip - 1
+        else:
+            frame.ip = frame.offset_to_index[instr.argval] - 1
 
 
 @VirtualMachine.register("POP_JUMP_IF_TRUE", "POP_JUMP_FORWARD_IF_TRUE", "POP_JUMP_BACKWARD_IF_TRUE")
-def _jump_if_true(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _jump_if_true(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     if bool(frame.pop()):
-        frame.ip = frame.offset_to_index[instr.argval] - 1
+        if instr.target_ip != -1:
+            frame.ip = instr.target_ip - 1
+        else:
+            frame.ip = frame.offset_to_index[instr.argval] - 1
 
 
 @VirtualMachine.register("GET_ITER")
-def _get_iter(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _get_iter(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     frame.push(iter(frame.pop()))
 
 
 @VirtualMachine.register("FOR_ITER", "FOR_ITER_GEN")
-def _for_iter(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _for_iter(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     iterator = frame.top()
     try:
         frame.push(next(iterator))
     except StopIteration:
         frame.pop()
-        frame.ip = frame.offset_to_index[instr.argval] - 1
+        if instr.target_ip != -1:
+            frame.ip = instr.target_ip - 1
+        else:
+            frame.ip = frame.offset_to_index[instr.argval] - 1
 
 
 @VirtualMachine.register("END_FOR")
-def _end_for(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _end_for(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     if frame.stack and not isinstance(frame.top(), (int, float, str, dict, list, set, tuple)):
         frame.pop()
 
 
 @VirtualMachine.register("MAKE_FUNCTION")
-def _make_function(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _make_function(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     code_target = frame.pop()
     frame.push(Function(code_target, vm))
 
 
 @VirtualMachine.register("PUSH_NULL")
-def _push_null(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _push_null(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     frame.push(NULL)
 
 
 @VirtualMachine.register("CALL", "CALL_FUNCTION")
-def _call(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _call(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     argc = instr.arg or 0
     args = frame.popn(argc)
     candidate = frame.pop()
@@ -663,17 +701,17 @@ def _call(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
 
 
 @VirtualMachine.register("RETURN_CONST")
-def _return_const(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> Any:
+def _return_const(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> Any:
     return instr.argval
 
 
 @VirtualMachine.register("RETURN_VALUE")
-def _return_value(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> Any:
+def _return_value(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> Any:
     return frame.pop() if frame.stack else None
 
 
 @VirtualMachine.register("POP_TOP")
-def _pop_top(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _pop_top(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     if frame.stack:
         frame.pop()
 
@@ -683,7 +721,7 @@ def _pop_top(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
 # ---------------------------------------------------------
 
 @VirtualMachine.register("PUSH_EXC_INFO")
-def _push_exc_info(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _push_exc_info(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     new_exc = frame.top()
     prev_exc = vm.exc_value
     vm.exc_value = new_exc
@@ -692,7 +730,7 @@ def _push_exc_info(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> 
 
 
 @VirtualMachine.register("CHECK_EXC_MATCH")
-def _check_exc_match(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _check_exc_match(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     target_type = frame.pop()
     exc = frame.pop()
 
@@ -707,14 +745,14 @@ def _check_exc_match(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -
 
 
 @VirtualMachine.register("POP_EXCEPT")
-def _pop_except(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _pop_except(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     if frame.stack:
         from_exc = frame.pop()
         vm.exc_value = from_exc
 
 
 @VirtualMachine.register("RERAISE")
-def _reraise(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _reraise(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     depth = instr.arg or 0
     exc = None
     if depth > 0 and len(frame.stack) >= depth:
@@ -730,7 +768,7 @@ def _reraise(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
 
 
 @VirtualMachine.register("RAISE_VARARGS")
-def _raise_varargs(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _raise_varargs(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     argc = instr.arg or 0
     if argc == 0:
         if vm.exc_value:
@@ -750,12 +788,12 @@ def _raise_varargs(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> 
 
 
 @VirtualMachine.register("SETUP_FINALLY")
-def _setup_finally(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _setup_finally(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     frame.block_stack.append(("finally", instr.argval, len(frame.stack)))
 
 
 @VirtualMachine.register("POP_BLOCK")
-def _pop_block(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _pop_block(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     if frame.block_stack:
         frame.block_stack.pop()
 
@@ -765,7 +803,7 @@ def _pop_block(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None
 # ---------------------------------------------------------
 
 @VirtualMachine.register("BEFORE_WITH")
-def _before_with(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _before_with(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     """Prepare context manager by calling __enter__ and pushing bound __exit__."""
     cm = frame.pop()
     exit_method = getattr(type(cm), "__exit__", getattr(cm, "__exit__", None))
@@ -781,7 +819,7 @@ def _before_with(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> No
 
 
 @VirtualMachine.register("WITH_EXCEPT_START")
-def _with_except_start(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _with_except_start(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     """Execute context manager's __exit__ upon exception."""
     exc = frame.top()
     exit_func = None
@@ -797,7 +835,7 @@ def _with_except_start(vm: VirtualMachine, frame: Frame, instr: dis.Instruction)
 
 
 @VirtualMachine.register("SETUP_WITH")
-def _setup_with(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _setup_with(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     cm = frame.top()
     exit_method = getattr(cm, "__exit__")
     enter_res = getattr(cm, "__enter__")()
@@ -806,5 +844,5 @@ def _setup_with(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> Non
 
 
 @VirtualMachine.register("RESUME", "NOP", "PRECALL", "CACHE")
-def _noop(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+def _noop(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     pass
