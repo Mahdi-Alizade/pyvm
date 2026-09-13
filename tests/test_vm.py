@@ -1,7 +1,7 @@
 """
 Comprehensive unit test suite for PyVM execution engine.
 Verifies arithmetic, data structures, control flow, functions,
-recursion, exception handling, and compiled bytecode (.pyc) execution.
+recursion, exceptions, .pyc execution, and context managers (with statement).
 """
 
 import importlib.util
@@ -165,14 +165,12 @@ res = caller()
         self.assertEqual(scope["res"], "recovered")
 
     def test_pyc_file_execution(self) -> None:
-        """Compile a snippet, write a valid .pyc binary, and execute via PyVM."""
         source = """
 pyc_magic = 42 * 2
 pyc_string = "pyc_success"
 """
         code_obj = compile(source, filename="<test_pyc>", mode="exec")
 
-        # Create temporary .pyc file with standard 16-byte header
         header = importlib.util.MAGIC_NUMBER + b"\x00" * 12
         with tempfile.NamedTemporaryFile(suffix=".pyc", delete=False) as tmp:
             tmp.write(header)
@@ -187,6 +185,32 @@ pyc_string = "pyc_success"
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    def test_context_manager_with_statement(self) -> None:
+        """Verify __enter__ and __exit__ lifecycle in a with statement."""
+        class MockResource:
+            def __init__(self):
+                self.entered = False
+                self.exited = False
+
+            def __enter__(self):
+                self.entered = True
+                return "resource_ready"
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self.exited = True
+                return False
+
+        self.vm.globals["res_obj"] = MockResource()
+        code = """
+with res_obj as r:
+    captured_val = r
+"""
+        self._execute(code)
+        res_instance = self.vm.globals["res_obj"]
+        self.assertTrue(res_instance.entered)
+        self.assertTrue(res_instance.exited)
+        self.assertEqual(self.vm.globals["captured_val"], "resource_ready")
 
 
 if __name__ == "__main__":
