@@ -1,7 +1,7 @@
 """
 A modular, high-performance Python Bytecode Virtual Machine.
 Uses an indexed O(1) opcode array dispatch pattern, isolated frame stacks,
-native Exception Table unwinding, and Context Manager (with statement) support.
+native Exception Table unwinding, Context Manager support, and modern string formatting.
 Compatible with Python 3.11 - 3.13.
 """
 
@@ -504,6 +504,28 @@ def _dict_update(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> No
     items = frame.pop()
     target_dict = frame.stack[-(instr.arg or 1)]
     target_dict.update(items)
+
+
+@VirtualMachine.register("FORMAT_SIMPLE")
+def _format_simple(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    """Fast-path string conversion for f-strings introduced in Python 3.13."""
+    val = frame.pop()
+    frame.push(str(val))
+
+
+@VirtualMachine.register("CONVERT_VALUE")
+def _convert_value(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    """Format conversion flag implementation (!s, !r, !a) for f-strings."""
+    val = frame.pop()
+    conv = instr.arg or 1
+    if conv == 1:
+        frame.push(str(val))
+    elif conv == 2:
+        frame.push(repr(val))
+    elif conv == 3:
+        frame.push(ascii(val))
+    else:
+        frame.push(val)
 
 
 @VirtualMachine.register("FORMAT_VALUE")
