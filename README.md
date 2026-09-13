@@ -1,3 +1,10 @@
+تمام ۱۲ تست با موفقیت کامل و در ۰.۰۱۹ ثانیه پاس شدند (Ran 12 tests in 0.019s - OK). پروتکل کانتکست‌منیجرها (with) و چرخه حیات __enter__ و __exit__ نیز به درستی تثبیت شد.
+
+حالا فایل مستندات README.md را به‌روزرسانی می‌کنیم تا کانتکست‌منیجرها و آپ‌کدهای جدید به لیست قابلیت‌ها اضافه شوند:
+
+D:\Mahdi Alizade\Projects\pyvm\README.md
+
+Markdown
 # PyVM - Python Bytecode Virtual Machine
 
 A modular, high-performance stack-based virtual machine written in pure Python that disassembles, interprets, and executes Python bytecode with isolated call frames.
@@ -6,8 +13,9 @@ A modular, high-performance stack-based virtual machine written in pure Python t
 
 - **O(1) Opcode Dispatch Table:** Replaces linear conditional chains with a direct dictionary dispatch pattern for minimal opcode decoding overhead.
 - **Frame-Isolated Execution:** Each function invocation instantiates an isolated `Frame` containing its own instruction pointer, evaluation stack, and local scope.
-- **Python 3.11 - 3.13 Compatible:** Supports modern calling conventions (`PUSH_NULL`, `CALL`), modern container optimizations (`BUILD_CONST_KEY_MAP`, `SET_UPDATE`), and instruction caching.
+- **Python 3.11 - 3.13 Compatible:** Supports modern calling conventions (`PUSH_NULL`, `CALL`), container optimizations (`BUILD_CONST_KEY_MAP`, `SET_UPDATE`), and instruction caching.
 - **Native Exception Handling:** Implements CPython-compatible exception table unwinding (`co_exceptiontable`) supporting `try...except`, custom `raise`, and cross-function propagation.
+- **Context Managers (`with` statement):** Full lifecycle management for `__enter__` and `__exit__` via `BEFORE_WITH` and `WITH_EXCEPT_START`.
 - **Compiled `.pyc` Loader:** Directly parses 16-byte headers and unmarshals `.pyc` bytecode binaries without requiring source code.
 - **Fast Local & Name Scopes:** Optimized variable lookups mimicking CPython's evaluation order (`LOAD_FAST`, `STORE_FAST`, `LOAD_GLOBAL`, `LOAD_NAME`).
 - **Interactive REPL & Tracer:** Built-in command-line shell with live instruction-by-instruction stack inspection via the `--trace` flag.
@@ -23,7 +31,7 @@ pyvm/
 ├── cli.py             # REPL interface, .py script runner, .pyc binary loader, and execution tracer
 ├── main.py            # Entry point running verification scenarios and benchmarks
 ├── tests/
-│   └── test_vm.py     # Unittest suite (arithmetic, recursion, control flow, exceptions, .pyc files)
+│   └── test_vm.py     # Unittest suite (arithmetic, recursion, control flow, exceptions, .pyc, with statement)
 ├── .gitignore         # Clean repository exclusions
 └── README.md          # Technical documentation
 Getting Started
@@ -92,6 +100,8 @@ Iteration: GET_ITER, FOR_ITER, END_FOR.
 Functions: MAKE_FUNCTION, CALL, RETURN_VALUE, RETURN_CONST.
 
 Exception Handling: PUSH_EXC_INFO, CHECK_EXC_MATCH, POP_EXCEPT, RERAISE, RAISE_VARARGS, SETUP_FINALLY, POP_BLOCK.
+
+Context Managers: BEFORE_WITH, WITH_EXCEPT_START, SETUP_WITH.
 
 License
 This project is open-source software licensed under the MIT License.
