@@ -1,6 +1,6 @@
 """
 A modular, high-performance Python Bytecode Virtual Machine.
-Uses a direct O(1) dispatch table pattern, isolated frame stacks,
+Uses an indexed O(1) opcode array dispatch pattern, isolated frame stacks,
 native Exception Table unwinding, and Context Manager (with statement) support.
 Compatible with Python 3.11 - 3.13.
 """
@@ -186,9 +186,10 @@ class Function:
 
 
 class VirtualMachine:
-    """Execution engine with O(1) table-driven opcode dispatching and exception handling."""
+    """Execution engine with indexed numeric opcode array dispatching."""
 
     _dispatch_table: Dict[str, Callable[["VirtualMachine", Frame, dis.Instruction], Any]] = {}
+    _opcode_array: List[Optional[Callable[["VirtualMachine", Frame, dis.Instruction], Any]]] = [None] * 256
 
     BINARY_OPS: Dict[str, Callable[[Any, Any], Any]] = {
         "+": operator.add,
@@ -220,10 +221,12 @@ class VirtualMachine:
 
     @classmethod
     def register(cls, *opnames: str):
-        """Decorator to map opcodes directly into the dispatch table."""
+        """Decorator to map opcodes into the dispatch table and numerical opcode array."""
         def decorator(func: Callable[["VirtualMachine", Frame, dis.Instruction], Any]):
             for op in opnames:
                 cls._dispatch_table[op] = func
+                if hasattr(dis, "opmap") and op in dis.opmap:
+                    cls._opcode_array[dis.opmap[op]] = func
             return func
         return decorator
 
@@ -273,13 +276,20 @@ class VirtualMachine:
 
     def run_frame(self, frame: Frame) -> Any:
         self.frames.append(frame)
+        opcode_array = self._opcode_array
+        dispatch_table = self._dispatch_table
+
         try:
             while frame.ip < len(frame.instructions):
                 instr = frame.instructions[frame.ip]
-                handler = self._dispatch_table.get(instr.opname)
 
+                # Fast path: numeric index lookup in opcode array
+                handler = opcode_array[instr.opcode]
                 if handler is None:
-                    raise NotImplementedError(f"Opcode '{instr.opname}' is not supported.")
+                    # Fallback path: dictionary lookup by opcode name
+                    handler = dispatch_table.get(instr.opname)
+                    if handler is None:
+                        raise NotImplementedError(f"Opcode '{instr.opname}' (code={instr.opcode}) is not supported.")
 
                 try:
                     result = handler(self, frame, instr)
@@ -493,6 +503,38 @@ def _dict_update(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> No
     target_dict.update(items)
 
 
+@VirtualMachine.register("FORMAT_VALUE")
+def _format_value(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    """Format single expression value for f-strings."""
+    # instr.arg format spec flags: 0x04 indicates format specifier string is on stack
+    has_spec = bool((instr.arg or 0) & 0x04)
+    format_spec = frame.pop() if has_spec else ""
+    val = frame.pop()
+
+    conversion = (instr.arg or 0) & 0x03
+    if conversion == 0x01:  # str()
+        val = str(val)
+    elif conversion == 0x02:  # repr()
+        val = repr(val)
+    elif conversion == 0x03:  # ascii()
+        val = ascii(val)
+
+    frame.push(format(val, format_spec))
+
+
+@VirtualMachine.register("BUILD_STRING")
+def _build_string(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    """Concatenate n strings from the stack into one string."""
+    count = instr.arg or 0
+    items = frame.popn(count)
+    frame.push("".join(items))
+
+
+@VirtualMachine.register("UNARY_POSITIVE")
+def _unary_positive(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    frame.push(+frame.pop())
+
+
 @VirtualMachine.register("UNARY_NEGATIVE", "UNARY_NOT", "UNARY_INVERT")
 def _unary_ops(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     val = frame.pop()
@@ -588,7 +630,7 @@ def _call(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
         if frame.stack and frame.top() is NULL:
             frame.pop()
     else:
-        # Method call where candidate is self/first argument and callable sits underneath
+        # Method invocation where receiver self is popped first and callable sits underneath
         args.insert(0, candidate)
         callable_target = frame.pop()
         if frame.stack and frame.top() is NULL:
@@ -719,7 +761,6 @@ def _before_with(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> No
 def _with_except_start(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     """Execute context manager's __exit__ upon exception."""
     exc = frame.top()
-    # Locate exit method on stack
     exit_func = None
     for item in reversed(frame.stack):
         if callable(item):
