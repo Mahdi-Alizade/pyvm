@@ -1,7 +1,7 @@
 """
 Comprehensive unit test suite for PyVM execution engine.
 Verifies arithmetic, data structures, control flow, functions,
-recursion, exceptions, .pyc execution, and context managers (with statement).
+recursion, exceptions, .pyc execution, context managers, and f-strings.
 """
 
 import importlib.util
@@ -187,7 +187,6 @@ pyc_string = "pyc_success"
                 os.remove(tmp_path)
 
     def test_context_manager_with_statement(self) -> None:
-        """Verify __enter__ and __exit__ lifecycle in a with statement."""
         class MockResource:
             def __init__(self):
                 self.entered = False
@@ -211,6 +210,16 @@ with res_obj as r:
         self.assertTrue(res_instance.entered)
         self.assertTrue(res_instance.exited)
         self.assertEqual(self.vm.globals["captured_val"], "resource_ready")
+
+    def test_fstring_formatting(self) -> None:
+        """Verify FORMAT_VALUE and BUILD_STRING opcodes."""
+        code = """
+name = "World"
+num = 42
+msg = f"Hello {name}, your score is {num * 2}!"
+"""
+        scope = self._execute(code)
+        self.assertEqual(scope["msg"], "Hello World, your score is 84!")
 
 
 if __name__ == "__main__":
