@@ -1,7 +1,8 @@
 """
 A modular, high-performance Python Bytecode Virtual Machine.
 Uses a direct O(1) dispatch table pattern, isolated frame stacks,
-and native Exception Table unwinding compatible with Python 3.11 - 3.13.
+native Exception Table unwinding, and Context Manager (with statement) support.
+Compatible with Python 3.11 - 3.13.
 """
 
 import builtins
@@ -282,7 +283,6 @@ class VirtualMachine:
 
                 try:
                     result = handler(self, frame, instr)
-                    # Correctly terminate frame execution when a return opcode is processed
                     if instr.opname in ("RETURN_VALUE", "RETURN_CONST"):
                         return result
                 except BaseException as exc:
@@ -623,7 +623,7 @@ def _push_exc_info(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> 
 @VirtualMachine.register("CHECK_EXC_MATCH")
 def _check_exc_match(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     target_type = frame.pop()
-    exc = frame.pop()  # Pop the tested exception copy
+    exc = frame.pop()
 
     if isinstance(exc, BaseException):
         match = isinstance(exc, target_type)
@@ -687,6 +687,46 @@ def _setup_finally(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> 
 def _pop_block(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     if frame.block_stack:
         frame.block_stack.pop()
+
+
+# ---------------------------------------------------------
+# Context Manager (With Statement) Opcodes
+# ---------------------------------------------------------
+
+@VirtualMachine.register("BEFORE_WITH")
+def _before_with(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    """Prepare context manager by calling __enter__ and pushing __exit__ to stack."""
+    cm = frame.pop()
+    exit_method = getattr(type(cm), "__exit__", getattr(cm, "__exit__", None))
+    enter_method = getattr(type(cm), "__enter__", getattr(cm, "__enter__", None))
+
+    if enter_method is None or exit_method is None:
+        raise TypeError(f"'{type(cm).__name__}' object does not support the context manager protocol")
+
+    # Stack layout in Python 3.11+: push bound __exit__, then result of __enter__()
+    bound_exit = exit_method.__get__(cm, type(cm))
+    enter_res = enter_method(cm)
+    frame.push(bound_exit)
+    frame.push(enter_res)
+
+
+@VirtualMachine.register("WITH_EXCEPT_START")
+def _with_except_start(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    """Execute context manager's __exit__ upon exception."""
+    # Top of stack contains the exception information; exit method is below it
+    exc = frame.top()
+    exit_func = frame.stack[-7] if len(frame.stack) >= 7 else frame.stack[0]
+    res = exit_func(type(exc), exc, exc.__traceback__ if hasattr(exc, "__traceback__") else None)
+    frame.push(res)
+
+
+@VirtualMachine.register("SETUP_WITH")
+def _setup_with(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
+    cm = frame.top()
+    exit_method = getattr(cm, "__exit__")
+    enter_res = getattr(cm, "__enter__")()
+    frame.push(exit_method)
+    frame.push(enter_res)
 
 
 @VirtualMachine.register("RESUME", "NOP", "PRECALL", "CACHE")
