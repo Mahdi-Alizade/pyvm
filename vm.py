@@ -583,8 +583,14 @@ def _call(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
 
     if candidate is NULL:
         callable_target = frame.pop()
-    else:
+    elif callable(candidate):
         callable_target = candidate
+        if frame.stack and frame.top() is NULL:
+            frame.pop()
+    else:
+        # Method call where candidate is self/first argument and callable sits underneath
+        args.insert(0, candidate)
+        callable_target = frame.pop()
         if frame.stack and frame.top() is NULL:
             frame.pop()
 
@@ -695,7 +701,7 @@ def _pop_block(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None
 
 @VirtualMachine.register("BEFORE_WITH")
 def _before_with(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
-    """Prepare context manager by calling __enter__ and pushing __exit__ to stack."""
+    """Prepare context manager by calling __enter__ and pushing bound __exit__."""
     cm = frame.pop()
     exit_method = getattr(type(cm), "__exit__", getattr(cm, "__exit__", None))
     enter_method = getattr(type(cm), "__enter__", getattr(cm, "__enter__", None))
@@ -703,7 +709,6 @@ def _before_with(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> No
     if enter_method is None or exit_method is None:
         raise TypeError(f"'{type(cm).__name__}' object does not support the context manager protocol")
 
-    # Stack layout in Python 3.11+: push bound __exit__, then result of __enter__()
     bound_exit = exit_method.__get__(cm, type(cm))
     enter_res = enter_method(cm)
     frame.push(bound_exit)
@@ -713,9 +718,16 @@ def _before_with(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> No
 @VirtualMachine.register("WITH_EXCEPT_START")
 def _with_except_start(vm: VirtualMachine, frame: Frame, instr: dis.Instruction) -> None:
     """Execute context manager's __exit__ upon exception."""
-    # Top of stack contains the exception information; exit method is below it
     exc = frame.top()
-    exit_func = frame.stack[-7] if len(frame.stack) >= 7 else frame.stack[0]
+    # Locate exit method on stack
+    exit_func = None
+    for item in reversed(frame.stack):
+        if callable(item):
+            exit_func = item
+            break
+    if exit_func is None:
+        exit_func = frame.stack[0]
+
     res = exit_func(type(exc), exc, exc.__traceback__ if hasattr(exc, "__traceback__") else None)
     frame.push(res)
 
