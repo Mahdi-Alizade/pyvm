@@ -2,7 +2,7 @@
 Comprehensive unit test suite for PyVM execution engine.
 Verifies arithmetic, data structures, control flow, functions,
 recursion, exceptions, .pyc execution, context managers, f-strings,
-loops (break/continue), and inlined comprehensions.
+loops (break/continue), comprehensions, and in-place binary operations.
 """
 
 import importlib.util
@@ -50,6 +50,22 @@ z = 1 << 4
         self.assertEqual(scope["x"], 7)
         self.assertEqual(scope["y"], 4)
         self.assertEqual(scope["z"], 16)
+
+    def test_inplace_operations(self) -> None:
+        """Verify in-place binary operators on numbers and mutable collections."""
+        code = """
+counter = 10
+counter += 5
+counter *= 2
+counter -= 6
+counter //= 3
+
+items = [1, 2]
+items += [3, 4]
+"""
+        scope = self._execute(code)
+        self.assertEqual(scope["counter"], 8)
+        self.assertEqual(scope["items"], [1, 2, 3, 4])
 
     def test_data_structures(self) -> None:
         code = """
@@ -116,7 +132,6 @@ for i in [1, 2, 3, 4, 5, 6, 7, 8, 9]:
         self.assertEqual(scope["odds_before_six"], [1, 3, 5])
 
     def test_inlined_list_comprehension(self) -> None:
-        """Verify modern Python 3.12+ inlined list comprehension opcodes."""
         code = """
 evens_squared = [n * 2 for n in range(6)]
 """
