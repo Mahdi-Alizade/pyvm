@@ -1,10 +1,3 @@
-تمام ۱۲ تست با موفقیت کامل و در ۰.۰۱۹ ثانیه پاس شدند (Ran 12 tests in 0.019s - OK). پروتکل کانتکست‌منیجرها (with) و چرخه حیات __enter__ و __exit__ نیز به درستی تثبیت شد.
-
-حالا فایل مستندات README.md را به‌روزرسانی می‌کنیم تا کانتکست‌منیجرها و آپ‌کدهای جدید به لیست قابلیت‌ها اضافه شوند:
-
-D:\Mahdi Alizade\Projects\pyvm\README.md
-
-Markdown
 # PyVM - Python Bytecode Virtual Machine
 
 A modular, high-performance stack-based virtual machine written in pure Python that disassembles, interprets, and executes Python bytecode with isolated call frames.
