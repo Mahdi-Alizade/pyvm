@@ -1,7 +1,8 @@
 """
 A modular, high-performance Python Bytecode Virtual Machine.
 Uses an indexed O(1) opcode array dispatch pattern, isolated frame stacks,
-pre-resolved jump targets, native Exception Table unwinding, and Context Manager support.
+pre-resolved jump targets, native Exception Table unwinding, Context Manager support,
+and inlined comprehension super-instructions.
 Compatible with Python 3.11 - 3.13.
 """
 
@@ -100,7 +101,6 @@ def _get_cached_code_data(code_obj: types.CodeType) -> Tuple[List[VMInstruction]
         offset_map = {instr.offset: idx for idx, instr in enumerate(raw_instructions)}
         exc_entries = _parse_exception_table(code_obj)
 
-        # Pre-resolve jump targets to instruction indices
         instructions: List[VMInstruction] = []
         for instr in raw_instructions:
             target_ip = -1
@@ -312,7 +312,6 @@ class VirtualMachine:
             while frame.ip < len(frame.instructions):
                 instr = frame.instructions[frame.ip]
 
-                # Direct O(1) integer dispatch
                 handler = opcode_array[instr.opcode] if instr.opcode < array_len else None
                 if handler is None:
                     handler = dispatch_table.get(instr.opname)
@@ -418,6 +417,27 @@ def _delete_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None
         del frame.locals[name]
     else:
         raise UnboundLocalError(f"local variable '{name}' referenced before assignment")
+
+
+@VirtualMachine.register("LOAD_FAST_AND_CLEAR")
+def _load_fast_and_clear(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    """Push local variable value (or NULL if undefined) and clear it from frame locals."""
+    name = instr.argval
+    val = frame.locals.pop(name, NULL)
+    frame.push(val)
+
+
+@VirtualMachine.register("STORE_FAST_LOAD_FAST")
+def _store_fast_load_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    """Store top of stack to first local and immediately push second local (Python 3.12+ inlined comprehension)."""
+    val = frame.pop()
+    if isinstance(instr.argval, tuple):
+        store_name, load_name = instr.argval
+    else:
+        store_name = load_name = instr.argval
+
+    frame.locals[store_name] = val
+    frame.push(frame.locals[load_name])
 
 
 @VirtualMachine.register("COPY")
@@ -533,14 +553,12 @@ def _dict_update(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None
 
 @VirtualMachine.register("FORMAT_SIMPLE")
 def _format_simple(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Fast-path string conversion for f-strings in Python 3.13."""
     val = frame.pop()
     frame.push(str(val))
 
 
 @VirtualMachine.register("CONVERT_VALUE")
 def _convert_value(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Format conversion flag implementation (!s, !r, !a) for f-strings."""
     val = frame.pop()
     conv = instr.arg or 1
     if conv == 1:
@@ -555,7 +573,6 @@ def _convert_value(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> No
 
 @VirtualMachine.register("FORMAT_VALUE")
 def _format_value(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Format single expression value for f-strings."""
     has_spec = bool((instr.arg or 0) & 0x04)
     format_spec = frame.pop() if has_spec else ""
     val = frame.pop()
@@ -573,7 +590,6 @@ def _format_value(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> Non
 
 @VirtualMachine.register("BUILD_STRING")
 def _build_string(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Concatenate n strings from the stack into one string."""
     count = instr.arg or 0
     items = frame.popn(count)
     frame.push("".join(items))
@@ -619,7 +635,6 @@ def _compare_op(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
 
 @VirtualMachine.register("JUMP_FORWARD", "JUMP_BACKWARD", "JUMP_ABSOLUTE")
 def _jump(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    # Use pre-resolved target_ip if available for O(1) jump
     if instr.target_ip != -1:
         frame.ip = instr.target_ip - 1
     else:
