@@ -421,7 +421,6 @@ def _delete_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None
 
 @VirtualMachine.register("LOAD_FAST_AND_CLEAR")
 def _load_fast_and_clear(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Push local variable value (or NULL if undefined) and clear it from frame locals."""
     name = instr.argval
     val = frame.locals.pop(name, NULL)
     frame.push(val)
@@ -429,7 +428,6 @@ def _load_fast_and_clear(vm: VirtualMachine, frame: Frame, instr: VMInstruction)
 
 @VirtualMachine.register("STORE_FAST_LOAD_FAST")
 def _store_fast_load_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Store top of stack to first local and immediately push second local (Python 3.12+ inlined comprehension)."""
     val = frame.pop()
     if isinstance(instr.argval, tuple):
         store_name, load_name = instr.argval
@@ -437,7 +435,7 @@ def _store_fast_load_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction
         store_name = load_name = instr.argval
 
     frame.locals[store_name] = val
-    frame.push(frame.locals[load_name])
+    frame.push(frame.locals.get(load_name, val))
 
 
 @VirtualMachine.register("COPY")
@@ -679,8 +677,8 @@ def _for_iter(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
 
 @VirtualMachine.register("END_FOR")
 def _end_for(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    if frame.stack and not isinstance(frame.top(), (int, float, str, dict, list, set, tuple)):
-        frame.pop()
+    # No-op in modern Python bytecode: stack cleanup is explicitly handled by POP_TOP
+    pass
 
 
 @VirtualMachine.register("MAKE_FUNCTION")
@@ -728,7 +726,10 @@ def _return_value(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> Any
 @VirtualMachine.register("POP_TOP")
 def _pop_top(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     if frame.stack:
-        frame.pop()
+        val = frame.pop()
+        # If NULL was pushed by LOAD_FAST_AND_CLEAR for undefined variable, ignore it safely
+        if val is NULL:
+            pass
 
 
 # ---------------------------------------------------------
