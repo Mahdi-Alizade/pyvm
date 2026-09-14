@@ -407,7 +407,12 @@ def _load_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
 
 @VirtualMachine.register("STORE_FAST")
 def _store_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    frame.locals[instr.argval] = frame.pop()
+    val = frame.pop()
+    name = instr.argval
+    if val is NULL:
+        frame.locals.pop(name, None)
+    else:
+        frame.locals[name] = val
 
 
 @VirtualMachine.register("DELETE_FAST")
@@ -668,7 +673,7 @@ def _for_iter(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     try:
         frame.push(next(iterator))
     except StopIteration:
-        frame.pop()
+        # In Python 3.12+, FOR_ITER jumps leaving iterator on stack to be cleaned by following POP_TOP
         if instr.target_ip != -1:
             frame.ip = instr.target_ip - 1
         else:
@@ -677,7 +682,6 @@ def _for_iter(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
 
 @VirtualMachine.register("END_FOR")
 def _end_for(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    # No-op in modern Python bytecode: stack cleanup is explicitly handled by POP_TOP
     pass
 
 
@@ -726,10 +730,7 @@ def _return_value(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> Any
 @VirtualMachine.register("POP_TOP")
 def _pop_top(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     if frame.stack:
-        val = frame.pop()
-        # If NULL was pushed by LOAD_FAST_AND_CLEAR for undefined variable, ignore it safely
-        if val is NULL:
-            pass
+        frame.pop()
 
 
 # ---------------------------------------------------------
