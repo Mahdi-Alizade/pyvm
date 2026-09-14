@@ -2,7 +2,7 @@
 A modular, high-performance Python Bytecode Virtual Machine.
 Uses an indexed O(1) opcode array dispatch pattern, isolated frame stacks,
 pre-resolved jump targets, native Exception Table unwinding, Context Manager support,
-and inlined comprehension super-instructions.
+inlined comprehension super-instructions, and in-place binary operations.
 Compatible with Python 3.11 - 3.13.
 """
 
@@ -230,6 +230,19 @@ class VirtualMachine:
         "^": operator.xor,
         "<<": operator.lshift,
         ">>": operator.rshift,
+        # In-place binary operators
+        "+=": operator.iadd,
+        "-=": operator.isub,
+        "*=": operator.imul,
+        "/=": operator.itruediv,
+        "//=": operator.ifloordiv,
+        "%=": operator.imod,
+        "**=": operator.ipow,
+        "&=": operator.iand,
+        "|=": operator.ior,
+        "^=": operator.ixor,
+        "<<=": operator.ilshift,
+        ">>=": operator.irshift,
     }
 
     COMPARE_OPS: Dict[str, Callable[[Any, Any], bool]] = {
@@ -614,14 +627,48 @@ def _unary_ops(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
         frame.push(~val)
 
 
-@VirtualMachine.register("BINARY_OP", "BINARY_ADD", "BINARY_SUBTRACT", "BINARY_MULTIPLY", "BINARY_TRUE_DIVIDE")
+@VirtualMachine.register(
+    "BINARY_OP", "BINARY_ADD", "BINARY_SUBTRACT", "BINARY_MULTIPLY", "BINARY_TRUE_DIVIDE",
+    "INPLACE_ADD", "INPLACE_SUBTRACT", "INPLACE_MULTIPLY", "INPLACE_TRUE_DIVIDE",
+    "INPLACE_FLOOR_DIVIDE", "INPLACE_MODULO", "INPLACE_POWER", "INPLACE_LSHIFT",
+    "INPLACE_RSHIFT", "INPLACE_AND", "INPLACE_XOR", "INPLACE_OR"
+)
 def _binary_ops(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     right = frame.pop()
     left = frame.pop()
-    sym = instr.argrepr.replace("=", "").strip()
+
+    # Handle legacy INPLACE_* opcodes
+    if instr.opname.startswith("INPLACE_"):
+        legacy_map = {
+            "INPLACE_ADD": operator.iadd,
+            "INPLACE_SUBTRACT": operator.isub,
+            "INPLACE_MULTIPLY": operator.imul,
+            "INPLACE_TRUE_DIVIDE": operator.itruediv,
+            "INPLACE_FLOOR_DIVIDE": operator.ifloordiv,
+            "INPLACE_MODULO": operator.imod,
+            "INPLACE_POWER": operator.ipow,
+            "INPLACE_LSHIFT": operator.ilshift,
+            "INPLACE_RSHIFT": operator.irshift,
+            "INPLACE_AND": operator.iand,
+            "INPLACE_XOR": operator.ixor,
+            "INPLACE_OR": operator.ior,
+        }
+        op_func = legacy_map.get(instr.opname, operator.add)
+        frame.push(op_func(left, right))
+        return
+
+    # Handle modern BINARY_OP with sym representation (e.g., '+', '+=', '*', '*=')
+    sym = instr.argrepr.strip()
     op_func = vm.BINARY_OPS.get(sym)
+
+    if op_func is None:
+        # Fallback stripped symbol
+        clean_sym = sym.replace("=", "").strip()
+        op_func = vm.BINARY_OPS.get(clean_sym)
+
     if op_func is None:
         raise NotImplementedError(f"Unsupported binary operator: '{instr.argrepr}'")
+
     frame.push(op_func(left, right))
 
 
@@ -673,7 +720,6 @@ def _for_iter(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     try:
         frame.push(next(iterator))
     except StopIteration:
-        # In Python 3.12+, FOR_ITER jumps leaving iterator on stack to be cleaned by following POP_TOP
         if instr.target_ip != -1:
             frame.ip = instr.target_ip - 1
         else:
