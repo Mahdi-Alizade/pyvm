@@ -2,7 +2,7 @@
 A modular, high-performance Python Bytecode Virtual Machine.
 Uses an indexed O(1) opcode array dispatch pattern, isolated frame stacks,
 pre-resolved jump targets, native Exception Table unwinding, Context Manager support,
-inlined comprehension super-instructions, and in-place binary operations.
+inlined comprehensions, in-place binary operations, and lexical closures.
 Compatible with Python 3.11 - 3.13.
 """
 
@@ -22,6 +22,25 @@ class _NullSentinel:
 
 
 NULL = _NullSentinel()
+
+
+class Cell:
+    """Represents a closure cell variable shared across nested scopes."""
+    __slots__ = ("cell_contents",)
+
+    def __init__(self, contents: Any = NULL) -> None:
+        self.cell_contents = contents
+
+    def get(self) -> Any:
+        if self.cell_contents is NULL:
+            raise ValueError("Cell is empty")
+        return self.cell_contents
+
+    def set(self, val: Any) -> None:
+        self.cell_contents = val
+
+    def __repr__(self) -> str:
+        return f"<Cell containing {self.cell_contents!r}>"
 
 
 class ExceptionTableEntry(NamedTuple):
@@ -91,7 +110,6 @@ def _parse_exception_table(code_obj: types.CodeType) -> List[ExceptionTableEntry
     return entries
 
 
-# Cache disassembled instructions, offsets, and exception tables per code object
 _CODE_CACHE: Dict[types.CodeType, Tuple[List[VMInstruction], Dict[int, int], List[ExceptionTableEntry]]] = {}
 
 
@@ -125,6 +143,8 @@ class Frame:
         "offset_to_index",
         "exception_entries",
         "block_stack",
+        "cells",
+        "freevars",
         "ip",
     )
 
@@ -134,6 +154,7 @@ class Frame:
         globals_scope: Dict[str, Any],
         locals_scope: Dict[str, Any],
         builtins_scope: Dict[str, Any],
+        closure_cells: Optional[Dict[str, Cell]] = None,
     ) -> None:
         self.code_obj = code_obj
         self.globals = globals_scope
@@ -146,6 +167,8 @@ class Frame:
             self.exception_entries,
         ) = _get_cached_code_data(code_obj)
         self.block_stack: List[Tuple[str, int, int]] = []
+        self.cells: Dict[str, Cell] = {}
+        self.freevars: Dict[str, Cell] = closure_cells if closure_cells is not None else {}
         self.ip: int = 0
 
     def push(self, value: Any) -> None:
@@ -174,7 +197,7 @@ class Frame:
 
 class Function:
     """User-defined callable function inside the VM."""
-    __slots__ = ("code_obj", "vm", "name", "defaults")
+    __slots__ = ("code_obj", "vm", "name", "defaults", "closure")
 
     def __init__(
         self,
@@ -182,11 +205,13 @@ class Function:
         vm: "VirtualMachine",
         name: Optional[str] = None,
         defaults: Tuple[Any, ...] = (),
+        closure: Optional[Dict[str, Cell]] = None,
     ) -> None:
         self.code_obj = code_obj
         self.vm = vm
         self.name = name or code_obj.co_name
         self.defaults = defaults
+        self.closure = closure or {}
 
     def __call__(self, *args: Any) -> Any:
         local_env: Dict[str, Any] = {}
@@ -205,6 +230,7 @@ class Function:
             globals_scope=self.vm.globals,
             locals_scope=local_env,
             builtins_scope=self.vm.builtins,
+            closure_cells=dict(self.closure),
         )
         return self.vm.run_frame(frame)
 
@@ -230,7 +256,6 @@ class VirtualMachine:
         "^": operator.xor,
         "<<": operator.lshift,
         ">>": operator.rshift,
-        # In-place binary operators
         "+=": operator.iadd,
         "-=": operator.isub,
         "*=": operator.imul,
@@ -437,6 +462,61 @@ def _delete_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None
         raise UnboundLocalError(f"local variable '{name}' referenced before assignment")
 
 
+@VirtualMachine.register("MAKE_CELL")
+def _make_cell(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    """Wrap an existing local variable into a Cell object for closures."""
+    name = instr.argval
+    initial_val = frame.locals.get(name, NULL)
+    cell = Cell(initial_val)
+    frame.cells[name] = cell
+
+
+@VirtualMachine.register("COPY_FREE_VARS")
+def _copy_free_vars(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    """No-op: Closure cells are directly bound to the frame upon instantiation."""
+    pass
+
+
+@VirtualMachine.register("LOAD_DEREF")
+def _load_deref(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    """Load value contained within a closure cell."""
+    name = instr.argval
+    if name in frame.cells:
+        frame.push(frame.cells[name].get())
+    elif name in frame.freevars:
+        frame.push(frame.freevars[name].get())
+    else:
+        raise NameError(f"free variable '{name}' referenced before assignment in enclosing scope")
+
+
+@VirtualMachine.register("STORE_DEREF")
+def _store_deref(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    """Store value into a closure cell."""
+    val = frame.pop()
+    name = instr.argval
+    if name in frame.cells:
+        frame.cells[name].set(val)
+    elif name in frame.freevars:
+        frame.freevars[name].set(val)
+    else:
+        cell = Cell(val)
+        frame.cells[name] = cell
+
+
+@VirtualMachine.register("LOAD_CLOSURE")
+def _load_closure(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    """Push reference to Cell object itself onto the stack."""
+    name = instr.argval
+    if name in frame.cells:
+        frame.push(frame.cells[name])
+    elif name in frame.freevars:
+        frame.push(frame.freevars[name])
+    else:
+        cell = Cell(NULL)
+        frame.cells[name] = cell
+        frame.push(cell)
+
+
 @VirtualMachine.register("LOAD_FAST_AND_CLEAR")
 def _load_fast_and_clear(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     name = instr.argval
@@ -637,7 +717,6 @@ def _binary_ops(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     right = frame.pop()
     left = frame.pop()
 
-    # Handle legacy INPLACE_* opcodes
     if instr.opname.startswith("INPLACE_"):
         legacy_map = {
             "INPLACE_ADD": operator.iadd,
@@ -657,12 +736,10 @@ def _binary_ops(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
         frame.push(op_func(left, right))
         return
 
-    # Handle modern BINARY_OP with sym representation (e.g., '+', '+=', '*', '*=')
     sym = instr.argrepr.strip()
     op_func = vm.BINARY_OPS.get(sym)
 
     if op_func is None:
-        # Fallback stripped symbol
         clean_sym = sym.replace("=", "").strip()
         op_func = vm.BINARY_OPS.get(clean_sym)
 
@@ -734,7 +811,23 @@ def _end_for(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
 @VirtualMachine.register("MAKE_FUNCTION")
 def _make_function(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     code_target = frame.pop()
-    frame.push(Function(code_target, vm))
+    closure_dict = {}
+
+    # Check for closure cells on stack (flag 0x08 in modern Python MAKE_FUNCTION)
+    if (instr.arg or 0) & 0x08:
+        closure_tuple = frame.pop()
+        freevars = code_target.co_freevars
+        for name, cell in zip(freevars, closure_tuple):
+            closure_dict[name] = cell
+    elif code_target.co_freevars:
+        # Fallback: bind active scope cells matching freevars
+        for name in code_target.co_freevars:
+            if name in frame.cells:
+                closure_dict[name] = frame.cells[name]
+            elif name in frame.freevars:
+                closure_dict[name] = frame.freevars[name]
+
+    frame.push(Function(code_target, vm, closure=closure_dict))
 
 
 @VirtualMachine.register("PUSH_NULL")
