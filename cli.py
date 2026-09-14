@@ -1,10 +1,11 @@
 """
 PyVM Command-Line Interface & Interactive REPL.
 Supports interactive bytecode shell, script execution, bytecode tracing,
-and direct loading of compiled Python bytecode (.pyc) files.
+disassembly inspection, and direct loading of compiled Python bytecode (.pyc) files.
 """
 
 import argparse
+import dis
 import importlib.util
 import marshal
 import sys
@@ -77,11 +78,20 @@ class PyVMCLI:
         except Exception:
             traceback.print_exc(file=sys.stderr)
 
+    def disassemble_source(self, source: str) -> None:
+        """Disassemble and display bytecode instructions for the given source snippet."""
+        try:
+            code_obj = compile(source, filename="<disassembly>", mode="exec")
+            print("-" * 60)
+            dis.dis(code_obj)
+            print("-" * 60)
+        except Exception as exc:
+            print(f"[!] Compilation error: {exc}", file=sys.stderr)
+
     def run_pyc_file(self, filepath: str) -> None:
         """Parse and execute a compiled .pyc bytecode file directly."""
         try:
             with open(filepath, "rb") as file:
-                # Read standard 16-byte .pyc header (Python 3.7+)
                 header = file.read(16)
                 if len(header) < 16:
                     raise ValueError(f"Corrupted .pyc header in '{filepath}' (less than 16 bytes).")
@@ -129,7 +139,6 @@ class PyVMCLI:
             try:
                 prompt = "... " if buffer else "pyvm>>> "
                 line = input(prompt)
-
                 stripped = line.strip()
 
                 if not buffer:
@@ -138,9 +147,19 @@ class PyVMCLI:
                         break
                     elif stripped == ".help":
                         print("REPL Commands:")
-                        print("  .globals  - Show defined global variables")
-                        print("  .clear    - Clear current input buffer")
-                        print("  .exit     - Terminate session")
+                        print("  .dis <code> - Disassemble source code without executing")
+                        print("  .reset      - Reset global environment to clean state")
+                        print("  .globals    - Show defined global variables")
+                        print("  .clear      - Clear current input buffer")
+                        print("  .exit       - Terminate session")
+                        continue
+                    elif stripped == ".reset":
+                        self.vm.globals.clear()
+                        print("[+] Environment reset successfully.")
+                        continue
+                    elif stripped.startswith(".dis "):
+                        code_part = line.split(".dis ", 1)[1]
+                        self.disassemble_source(code_part)
                         continue
                     elif stripped == ".globals":
                         user_globals = {
