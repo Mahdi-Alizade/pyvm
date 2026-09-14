@@ -2,7 +2,7 @@
 Comprehensive unit test suite for PyVM execution engine.
 Verifies arithmetic, data structures, control flow, functions,
 recursion, exceptions, .pyc execution, context managers, f-strings,
-and loop control flow (break and continue).
+loops (break/continue), and inlined comprehensions.
 """
 
 import importlib.util
@@ -103,7 +103,6 @@ for n in [1, 2, 3, 4, 5, 6]:
         self.assertEqual(scope["evens"], [2, 4, 6])
 
     def test_loop_break_and_continue(self) -> None:
-        """Verify pre-resolved jump targets with break and continue statements."""
         code = """
 odds_before_six = []
 for i in [1, 2, 3, 4, 5, 6, 7, 8, 9]:
@@ -115,6 +114,14 @@ for i in [1, 2, 3, 4, 5, 6, 7, 8, 9]:
 """
         scope = self._execute(code)
         self.assertEqual(scope["odds_before_six"], [1, 3, 5])
+
+    def test_inlined_list_comprehension(self) -> None:
+        """Verify modern Python 3.12+ inlined list comprehension opcodes."""
+        code = """
+evens_squared = [n * 2 for n in range(6)]
+"""
+        scope = self._execute(code)
+        self.assertEqual(scope["evens_squared"], [0, 2, 4, 6, 8, 10])
 
     def test_user_defined_function(self) -> None:
         code = """
