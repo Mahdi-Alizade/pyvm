@@ -2,7 +2,7 @@
 Comprehensive unit test suite for PyVM execution engine.
 Verifies arithmetic, data structures, control flow, functions,
 recursion, exceptions, .pyc execution, context managers, f-strings,
-loops (break/continue), comprehensions, and in-place binary operations.
+loops (break/continue), comprehensions, in-place operations, and closures.
 """
 
 import importlib.util
@@ -52,7 +52,6 @@ z = 1 << 4
         self.assertEqual(scope["z"], 16)
 
     def test_inplace_operations(self) -> None:
-        """Verify in-place binary operators on numbers and mutable collections."""
         code = """
 counter = 10
 counter += 5
@@ -66,6 +65,38 @@ items += [3, 4]
         scope = self._execute(code)
         self.assertEqual(scope["counter"], 8)
         self.assertEqual(scope["items"], [1, 2, 3, 4])
+
+    def test_closures_and_cell_variables(self) -> None:
+        """Verify lexical scoping, closures, and nonlocal mutation via Cell dereferencing."""
+        code = """
+def make_multiplier(factor):
+    def multiply(n):
+        return n * factor
+    return multiply
+
+double = make_multiplier(2)
+triple = make_multiplier(3)
+
+res_double = double(5)
+res_triple = triple(5)
+
+def make_counter(start):
+    count = start
+    def step():
+        nonlocal count
+        count += 1
+        return count
+    return step
+
+counter = make_counter(10)
+c1 = counter()
+c2 = counter()
+"""
+        scope = self._execute(code)
+        self.assertEqual(scope["res_double"], 10)
+        self.assertEqual(scope["res_triple"], 15)
+        self.assertEqual(scope["c1"], 11)
+        self.assertEqual(scope["c2"], 12)
 
     def test_data_structures(self) -> None:
         code = """
