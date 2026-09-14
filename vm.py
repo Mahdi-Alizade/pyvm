@@ -813,14 +813,12 @@ def _make_function(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> No
     code_target = frame.pop()
     closure_dict = {}
 
-    # Check for closure cells on stack (flag 0x08 in modern Python MAKE_FUNCTION)
     if (instr.arg or 0) & 0x08:
         closure_tuple = frame.pop()
         freevars = code_target.co_freevars
         for name, cell in zip(freevars, closure_tuple):
             closure_dict[name] = cell
     elif code_target.co_freevars:
-        # Fallback: bind active scope cells matching freevars
         for name in code_target.co_freevars:
             if name in frame.cells:
                 closure_dict[name] = frame.cells[name]
@@ -828,6 +826,22 @@ def _make_function(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> No
                 closure_dict[name] = frame.freevars[name]
 
     frame.push(Function(code_target, vm, closure=closure_dict))
+
+
+@VirtualMachine.register("SET_FUNCTION_ATTRIBUTE")
+def _set_function_attribute(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    """Assign function metadata attributes (defaults, annotations, closures) in Python 3.13."""
+    attr_value = frame.pop()
+    func_target = frame.top()
+
+    flag = instr.arg or 0
+    if flag == 0x01:  # defaults
+        func_target.defaults = tuple(attr_value)
+    elif flag == 0x08:  # closure cells
+        if hasattr(func_target, "code_obj"):
+            freevars = func_target.code_obj.co_freevars
+            for name, cell in zip(freevars, attr_value):
+                func_target.closure[name] = cell
 
 
 @VirtualMachine.register("PUSH_NULL")
