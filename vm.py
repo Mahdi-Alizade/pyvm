@@ -211,7 +211,7 @@ class Function:
         self.vm = vm
         self.name = name or code_obj.co_name
         self.defaults = defaults
-        self.closure = closure or {}
+        self.closure: Dict[str, Cell] = closure or {}
 
     def __call__(self, *args: Any) -> Any:
         local_env: Dict[str, Any] = {}
@@ -408,7 +408,9 @@ def _delete_global(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> No
 @VirtualMachine.register("LOAD_NAME")
 def _load_name(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     name = instr.argval
-    if name in frame.locals:
+    if name in frame.cells:
+        frame.push(frame.cells[name].get())
+    elif name in frame.locals:
         frame.push(frame.locals[name])
     elif name in frame.globals:
         frame.push(frame.globals[name])
@@ -420,13 +422,20 @@ def _load_name(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
 
 @VirtualMachine.register("STORE_NAME")
 def _store_name(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    frame.locals[instr.argval] = frame.pop()
+    name = instr.argval
+    val = frame.pop()
+    if name in frame.cells:
+        frame.cells[name].set(val)
+    else:
+        frame.locals[name] = val
 
 
 @VirtualMachine.register("DELETE_NAME")
 def _delete_name(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     name = instr.argval
-    if name in frame.locals:
+    if name in frame.cells:
+        del frame.cells[name]
+    elif name in frame.locals:
         del frame.locals[name]
     elif name in frame.globals:
         del frame.globals[name]
@@ -437,7 +446,9 @@ def _delete_name(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None
 @VirtualMachine.register("LOAD_FAST")
 def _load_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     name = instr.argval
-    if name in frame.locals:
+    if name in frame.cells:
+        frame.push(frame.cells[name].get())
+    elif name in frame.locals:
         frame.push(frame.locals[name])
     else:
         raise UnboundLocalError(f"local variable '{name}' referenced before assignment")
@@ -447,7 +458,9 @@ def _load_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
 def _store_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     val = frame.pop()
     name = instr.argval
-    if val is NULL:
+    if name in frame.cells:
+        frame.cells[name].set(val)
+    elif val is NULL:
         frame.locals.pop(name, None)
     else:
         frame.locals[name] = val
@@ -456,7 +469,9 @@ def _store_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
 @VirtualMachine.register("DELETE_FAST")
 def _delete_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     name = instr.argval
-    if name in frame.locals:
+    if name in frame.cells:
+        del frame.cells[name]
+    elif name in frame.locals:
         del frame.locals[name]
     else:
         raise UnboundLocalError(f"local variable '{name}' referenced before assignment")
@@ -464,7 +479,7 @@ def _delete_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None
 
 @VirtualMachine.register("MAKE_CELL")
 def _make_cell(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Wrap an existing local variable into a Cell object for closures."""
+    """Create cell variable, preserving initial local value if present."""
     name = instr.argval
     initial_val = frame.locals.get(name, NULL)
     cell = Cell(initial_val)
@@ -812,12 +827,14 @@ def _make_function(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> No
     code_target = frame.pop()
     closure_dict = {}
 
+    # In Python 3.11/3.12, if flag 0x08 is set, the closure tuple was pushed before the code object
     if (instr.arg or 0) & 0x08:
         closure_tuple = frame.pop()
         freevars = code_target.co_freevars
         for name, cell in zip(freevars, closure_tuple):
             closure_dict[name] = cell
     elif code_target.co_freevars:
+        # Fallback closure resolution from enclosing frame
         for name in code_target.co_freevars:
             if name in frame.cells:
                 closure_dict[name] = frame.cells[name]
@@ -829,9 +846,17 @@ def _make_function(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> No
 
 @VirtualMachine.register("SET_FUNCTION_ATTRIBUTE")
 def _set_function_attribute(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Pop attribute value, pop function, set attribute, and push function back (Python 3.13)."""
-    attr_value = frame.pop()
-    func_target = frame.pop()
+    """Assign function attribute (defaults, closure tuple, annotations)."""
+    top_item = frame.pop()
+    second_item = frame.pop()
+
+    # Distinguish func and attr: one is Function, other is tuple/dict
+    if isinstance(top_item, Function):
+        func_target = top_item
+        attr_value = second_item
+    else:
+        attr_value = top_item
+        func_target = second_item
 
     flag = instr.arg or 0
     if flag == 0x01:  # defaults
