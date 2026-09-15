@@ -734,10 +734,8 @@ def _dict_merge(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
 
 @VirtualMachine.register("CALL_INTRINSIC_1")
 def _call_intrinsic_1(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Execute 1-argument runtime intrinsic (e.g. sequence unpacking into tuple for *args)."""
     val = frame.pop()
     sub_op = instr.arg or 0
-    # Intrinsic 5/6: INTRINSIC_UNPACK_LIST or sequence preparation for CALL_FUNCTION_EX
     if sub_op in (5, 6):
         frame.push(tuple(val))
     else:
@@ -749,7 +747,6 @@ def _call_intrinsic_1(vm: VirtualMachine, frame: Frame, instr: VMInstruction) ->
 
 @VirtualMachine.register("CALL_INTRINSIC_2")
 def _call_intrinsic_2(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Execute 2-argument runtime intrinsic function."""
     arg2 = frame.pop()
     arg1 = frame.pop()
     frame.push((arg1, arg2))
@@ -1021,13 +1018,20 @@ def _call_kw(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
 
 @VirtualMachine.register("CALL_FUNCTION_EX")
 def _call_function_ex(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    """Call function with unpacked args and kwargs (*args, **kwargs)."""
     has_kwargs = bool((instr.arg or 0) & 0x01)
     kwargs = frame.pop() if has_kwargs else {}
     args = frame.pop()
 
-    callable_target = frame.pop()
-    if frame.stack and frame.top() is NULL:
-        frame.pop()
+    candidate = frame.pop()
+    if candidate is NULL:
+        callable_target = frame.pop()
+    elif callable(candidate):
+        callable_target = candidate
+        if frame.stack and frame.top() is NULL:
+            frame.pop()
+    else:
+        callable_target = candidate
 
     frame.push(callable_target(*args, **kwargs))
 
