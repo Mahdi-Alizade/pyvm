@@ -2,7 +2,8 @@
 A modular, high-performance Python Bytecode Virtual Machine.
 Uses an indexed O(1) opcode array dispatch pattern, isolated frame stacks,
 pre-resolved jump targets, native Exception Table unwinding, Context Manager support,
-inlined comprehensions, in-place binary operations, and lexical closures.
+inlined comprehensions, in-place binary operations, lexical closures,
+and advanced function calling (*args, **kwargs, keyword arguments, intrinsic functions).
 Compatible with Python 3.11 - 3.13.
 """
 
@@ -196,8 +197,8 @@ class Frame:
 
 
 class Function:
-    """User-defined callable function inside the VM."""
-    __slots__ = ("code_obj", "vm", "name", "defaults", "closure")
+    """User-defined callable function inside the VM supporting *args, **kwargs, and defaults."""
+    __slots__ = ("code_obj", "vm", "name", "defaults", "kwdefaults", "closure")
 
     def __init__(
         self,
@@ -205,25 +206,63 @@ class Function:
         vm: "VirtualMachine",
         name: Optional[str] = None,
         defaults: Tuple[Any, ...] = (),
+        kwdefaults: Optional[Dict[str, Any]] = None,
         closure: Optional[Dict[str, Cell]] = None,
     ) -> None:
         self.code_obj = code_obj
         self.vm = vm
         self.name = name or code_obj.co_name
         self.defaults = defaults
+        self.kwdefaults = kwdefaults or {}
         self.closure: Dict[str, Cell] = closure or {}
 
-    def __call__(self, *args: Any) -> Any:
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
         local_env: Dict[str, Any] = {}
-        arg_names = self.code_obj.co_varnames[: self.code_obj.co_argcount]
+        co = self.code_obj
+
+        pos_count = co.co_argcount
+        kwonly_count = getattr(co, "co_kwonlyargcount", 0)
+        total_args = pos_count + kwonly_count
+        arg_names = co.co_varnames[:total_args]
+        pos_names = co.co_varnames[:pos_count]
+        kwonly_names = co.co_varnames[pos_count:total_args]
+
+        has_varargs = bool(co.co_flags & 0x04)
+        has_varkw = bool(co.co_flags & 0x08)
+
+        varargs_idx = total_args if has_varargs else -1
+        varkw_idx = (total_args + (1 if has_varargs else 0)) if has_varkw else -1
+
+        varargs_name = co.co_varnames[varargs_idx] if has_varargs else None
+        varkw_name = co.co_varnames[varkw_idx] if has_varkw else None
+
+        assigned_pos = min(len(args), pos_count)
+        for i in range(assigned_pos):
+            local_env[pos_names[i]] = args[i]
+
+        if has_varargs:
+            local_env[varargs_name] = tuple(args[pos_count:])
 
         if self.defaults:
-            offset = len(arg_names) - len(self.defaults)
+            def_offset = pos_count - len(self.defaults)
             for idx, default_val in enumerate(self.defaults):
-                local_env[arg_names[offset + idx]] = default_val
+                param_name = pos_names[def_offset + idx]
+                if param_name not in local_env:
+                    local_env[param_name] = default_val
 
-        for name, val in zip(arg_names, args):
-            local_env[name] = val
+        for kwn in kwonly_names:
+            if kwn in self.kwdefaults:
+                local_env[kwn] = self.kwdefaults[kwn]
+
+        extra_kw = {}
+        for k, v in kwargs.items():
+            if k in arg_names:
+                local_env[k] = v
+            elif has_varkw:
+                extra_kw[k] = v
+
+        if has_varkw:
+            local_env[varkw_name] = extra_kw
 
         frame = Frame(
             code_obj=self.code_obj,
@@ -483,7 +522,6 @@ def _delete_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None
 
 @VirtualMachine.register("MAKE_CELL")
 def _make_cell(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Wrap an existing local variable into a Cell object for closures."""
     name = instr.argval
     initial_val = frame.locals.get(name, NULL)
     cell = Cell(initial_val)
@@ -497,7 +535,6 @@ def _copy_free_vars(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> N
 
 @VirtualMachine.register("LOAD_DEREF")
 def _load_deref(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Load value contained within a closure cell with automatic Cell unwrapping."""
     name = instr.argval
     target = None
 
@@ -517,7 +554,6 @@ def _load_deref(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
 
 @VirtualMachine.register("STORE_DEREF")
 def _store_deref(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Store value into a closure cell with automatic Cell conversion."""
     val = frame.pop()
     name = instr.argval
 
@@ -539,7 +575,6 @@ def _store_deref(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None
 
 @VirtualMachine.register("LOAD_CLOSURE")
 def _load_closure(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Push reference to Cell object itself onto the stack."""
     name = instr.argval
     if name in frame.cells:
         cell = frame.cells[name]
@@ -688,6 +723,36 @@ def _dict_update(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None
     items = frame.pop()
     target_dict = frame.stack[-(instr.arg or 1)]
     target_dict.update(items)
+
+
+@VirtualMachine.register("DICT_MERGE")
+def _dict_merge(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    items = frame.pop()
+    target_dict = frame.stack[-(instr.arg or 1)]
+    target_dict.update(items)
+
+
+@VirtualMachine.register("CALL_INTRINSIC_1")
+def _call_intrinsic_1(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    """Execute 1-argument runtime intrinsic (e.g. sequence unpacking into tuple for *args)."""
+    val = frame.pop()
+    sub_op = instr.arg or 0
+    # Intrinsic 5/6: INTRINSIC_UNPACK_LIST or sequence preparation for CALL_FUNCTION_EX
+    if sub_op in (5, 6):
+        frame.push(tuple(val))
+    else:
+        try:
+            frame.push(tuple(val))
+        except TypeError:
+            frame.push(val)
+
+
+@VirtualMachine.register("CALL_INTRINSIC_2")
+def _call_intrinsic_2(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    """Execute 2-argument runtime intrinsic function."""
+    arg2 = frame.pop()
+    arg1 = frame.pop()
+    frame.push((arg1, arg2))
 
 
 @VirtualMachine.register("FORMAT_SIMPLE")
@@ -875,7 +940,6 @@ def _make_function(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> No
 
 @VirtualMachine.register("SET_FUNCTION_ATTRIBUTE")
 def _set_function_attribute(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Assign function attribute (defaults, closure tuple, annotations)."""
     top_item = frame.pop()
     second_item = frame.pop()
 
@@ -887,9 +951,11 @@ def _set_function_attribute(vm: VirtualMachine, frame: Frame, instr: VMInstructi
         func_target = second_item
 
     flag = instr.arg or 0
-    if flag == 0x01:  # defaults
+    if flag == 0x01:
         func_target.defaults = tuple(attr_value)
-    elif flag == 0x08:  # closure cells
+    elif flag == 0x02:
+        func_target.kwdefaults = dict(attr_value)
+    elif flag == 0x08:
         if hasattr(func_target, "code_obj"):
             freevars = func_target.code_obj.co_freevars
             for name, cell in zip(freevars, attr_value):
@@ -922,6 +988,48 @@ def _call(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
             frame.pop()
 
     frame.push(callable_target(*args))
+
+
+@VirtualMachine.register("CALL_FUNCTION_KW", "CALL_KW")
+def _call_kw(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    keys_tuple = frame.pop()
+    argc = instr.arg or 0
+    all_args = frame.popn(argc)
+
+    kw_count = len(keys_tuple)
+    pos_count = argc - kw_count
+
+    pos_args = all_args[:pos_count]
+    kw_values = all_args[pos_count:]
+    kwargs = dict(zip(keys_tuple, kw_values))
+
+    candidate = frame.pop()
+    if candidate is NULL:
+        callable_target = frame.pop()
+    elif callable(candidate):
+        callable_target = candidate
+        if frame.stack and frame.top() is NULL:
+            frame.pop()
+    else:
+        pos_args.insert(0, candidate)
+        callable_target = frame.pop()
+        if frame.stack and frame.top() is NULL:
+            frame.pop()
+
+    frame.push(callable_target(*pos_args, **kwargs))
+
+
+@VirtualMachine.register("CALL_FUNCTION_EX")
+def _call_function_ex(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
+    has_kwargs = bool((instr.arg or 0) & 0x01)
+    kwargs = frame.pop() if has_kwargs else {}
+    args = frame.pop()
+
+    callable_target = frame.pop()
+    if frame.stack and frame.top() is NULL:
+        frame.pop()
+
+    frame.push(callable_target(*args, **kwargs))
 
 
 @VirtualMachine.register("RETURN_CONST")

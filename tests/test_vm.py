@@ -2,7 +2,8 @@
 Comprehensive unit test suite for PyVM execution engine.
 Verifies arithmetic, data structures, control flow, functions,
 recursion, exceptions, .pyc execution, context managers, f-strings,
-loops (break/continue), comprehensions, in-place operations, and closures.
+loops (break/continue), comprehensions, in-place operations, closures,
+and advanced arguments (*args, **kwargs, keyword calls).
 """
 
 import importlib.util
@@ -67,7 +68,6 @@ items += [3, 4]
         self.assertEqual(scope["items"], [1, 2, 3, 4])
 
     def test_closures_and_cell_variables(self) -> None:
-        """Verify lexical scoping, closures, and nonlocal mutation via Cell dereferencing."""
         code = """
 def make_multiplier(factor):
     def multiply(n):
@@ -97,6 +97,33 @@ c2 = counter()
         self.assertEqual(scope["res_triple"], 15)
         self.assertEqual(scope["c1"], 11)
         self.assertEqual(scope["c2"], 12)
+
+    def test_varargs_and_kwargs(self) -> None:
+        """Verify keyword arguments, *args, and **kwargs unpacking."""
+        code = """
+def configure(host, port=8080, *tags, **options):
+    return {
+        "host": host,
+        "port": port,
+        "tags": tags,
+        "debug": options.get("debug", False),
+        "workers": options.get("workers", 1)
+    }
+
+c1 = configure("localhost", port=9000, debug=True)
+c2 = configure("127.0.0.1", 3000, "web", "api", workers=4)
+
+extra_tags = ["prod", "v2"]
+extra_opts = {"workers": 8, "debug": False}
+c3 = configure("remote.host", 443, *extra_tags, **extra_opts)
+"""
+        scope = self._execute(code)
+        self.assertEqual(scope["c1"]["port"], 9000)
+        self.assertEqual(scope["c1"]["debug"], True)
+        self.assertEqual(scope["c2"]["tags"], ("web", "api"))
+        self.assertEqual(scope["c2"]["workers"], 4)
+        self.assertEqual(scope["c3"]["tags"], ("prod", "v2"))
+        self.assertEqual(scope["c3"]["workers"], 8)
 
     def test_data_structures(self) -> None:
         code = """
