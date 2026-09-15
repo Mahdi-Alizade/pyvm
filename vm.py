@@ -230,7 +230,7 @@ class Function:
             globals_scope=self.vm.globals,
             locals_scope=local_env,
             builtins_scope=self.vm.builtins,
-            closure_cells=dict(self.closure),
+            closure_cells=self.closure,
         )
         return self.vm.run_frame(frame)
 
@@ -447,7 +447,8 @@ def _delete_name(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None
 def _load_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     name = instr.argval
     if name in frame.cells:
-        frame.push(frame.cells[name].get())
+        val = frame.cells[name]
+        frame.push(val.get() if isinstance(val, Cell) else val)
     elif name in frame.locals:
         frame.push(frame.locals[name])
     else:
@@ -459,7 +460,10 @@ def _store_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     val = frame.pop()
     name = instr.argval
     if name in frame.cells:
-        frame.cells[name].set(val)
+        if isinstance(frame.cells[name], Cell):
+            frame.cells[name].set(val)
+        else:
+            frame.cells[name] = Cell(val)
     elif val is NULL:
         frame.locals.pop(name, None)
     else:
@@ -479,7 +483,7 @@ def _delete_fast(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None
 
 @VirtualMachine.register("MAKE_CELL")
 def _make_cell(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Create cell variable, preserving initial local value if present."""
+    """Wrap an existing local variable into a Cell object for closures."""
     name = instr.argval
     initial_val = frame.locals.get(name, NULL)
     cell = Cell(initial_val)
@@ -493,28 +497,44 @@ def _copy_free_vars(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> N
 
 @VirtualMachine.register("LOAD_DEREF")
 def _load_deref(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Load value contained within a closure cell."""
+    """Load value contained within a closure cell with automatic Cell unwrapping."""
     name = instr.argval
+    target = None
+
     if name in frame.cells:
-        frame.push(frame.cells[name].get())
+        target = frame.cells[name]
     elif name in frame.freevars:
-        frame.push(frame.freevars[name].get())
-    else:
+        target = frame.freevars[name]
+
+    if target is None:
         raise NameError(f"free variable '{name}' referenced before assignment in enclosing scope")
+
+    if isinstance(target, Cell):
+        frame.push(target.get())
+    else:
+        frame.push(target)
 
 
 @VirtualMachine.register("STORE_DEREF")
 def _store_deref(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Store value into a closure cell."""
+    """Store value into a closure cell with automatic Cell conversion."""
     val = frame.pop()
     name = instr.argval
+
     if name in frame.cells:
-        frame.cells[name].set(val)
+        target = frame.cells[name]
+        if isinstance(target, Cell):
+            target.set(val)
+        else:
+            frame.cells[name] = Cell(val)
     elif name in frame.freevars:
-        frame.freevars[name].set(val)
+        target = frame.freevars[name]
+        if isinstance(target, Cell):
+            target.set(val)
+        else:
+            frame.freevars[name] = Cell(val)
     else:
-        cell = Cell(val)
-        frame.cells[name] = cell
+        frame.cells[name] = Cell(val)
 
 
 @VirtualMachine.register("LOAD_CLOSURE")
@@ -522,11 +542,20 @@ def _load_closure(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> Non
     """Push reference to Cell object itself onto the stack."""
     name = instr.argval
     if name in frame.cells:
-        frame.push(frame.cells[name])
+        cell = frame.cells[name]
+        if not isinstance(cell, Cell):
+            cell = Cell(cell)
+            frame.cells[name] = cell
+        frame.push(cell)
     elif name in frame.freevars:
-        frame.push(frame.freevars[name])
+        cell = frame.freevars[name]
+        if not isinstance(cell, Cell):
+            cell = Cell(cell)
+            frame.freevars[name] = cell
+        frame.push(cell)
     else:
-        cell = Cell(NULL)
+        initial = frame.locals.get(name, NULL)
+        cell = Cell(initial)
         frame.cells[name] = cell
         frame.push(cell)
 
@@ -825,21 +854,21 @@ def _end_for(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
 @VirtualMachine.register("MAKE_FUNCTION")
 def _make_function(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
     code_target = frame.pop()
-    closure_dict = {}
+    closure_dict: Dict[str, Cell] = {}
 
-    # In Python 3.11/3.12, if flag 0x08 is set, the closure tuple was pushed before the code object
     if (instr.arg or 0) & 0x08:
         closure_tuple = frame.pop()
         freevars = code_target.co_freevars
         for name, cell in zip(freevars, closure_tuple):
-            closure_dict[name] = cell
+            closure_dict[name] = cell if isinstance(cell, Cell) else Cell(cell)
     elif code_target.co_freevars:
-        # Fallback closure resolution from enclosing frame
         for name in code_target.co_freevars:
             if name in frame.cells:
-                closure_dict[name] = frame.cells[name]
+                c = frame.cells[name]
+                closure_dict[name] = c if isinstance(c, Cell) else Cell(c)
             elif name in frame.freevars:
-                closure_dict[name] = frame.freevars[name]
+                c = frame.freevars[name]
+                closure_dict[name] = c if isinstance(c, Cell) else Cell(c)
 
     frame.push(Function(code_target, vm, closure=closure_dict))
 
@@ -850,7 +879,6 @@ def _set_function_attribute(vm: VirtualMachine, frame: Frame, instr: VMInstructi
     top_item = frame.pop()
     second_item = frame.pop()
 
-    # Distinguish func and attr: one is Function, other is tuple/dict
     if isinstance(top_item, Function):
         func_target = top_item
         attr_value = second_item
@@ -865,7 +893,7 @@ def _set_function_attribute(vm: VirtualMachine, frame: Frame, instr: VMInstructi
         if hasattr(func_target, "code_obj"):
             freevars = func_target.code_obj.co_freevars
             for name, cell in zip(freevars, attr_value):
-                func_target.closure[name] = cell
+                func_target.closure[name] = cell if isinstance(cell, Cell) else Cell(cell)
 
     frame.push(func_target)
 
