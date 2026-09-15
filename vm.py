@@ -473,7 +473,6 @@ def _make_cell(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
 
 @VirtualMachine.register("COPY_FREE_VARS")
 def _copy_free_vars(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """No-op: Closure cells are directly bound to the frame upon instantiation."""
     pass
 
 
@@ -830,9 +829,9 @@ def _make_function(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> No
 
 @VirtualMachine.register("SET_FUNCTION_ATTRIBUTE")
 def _set_function_attribute(vm: VirtualMachine, frame: Frame, instr: VMInstruction) -> None:
-    """Assign function metadata attributes (defaults, annotations, closures) in Python 3.13."""
+    """Pop attribute value, pop function, set attribute, and push function back (Python 3.13)."""
     attr_value = frame.pop()
-    func_target = frame.top()
+    func_target = frame.pop()
 
     flag = instr.arg or 0
     if flag == 0x01:  # defaults
@@ -842,6 +841,8 @@ def _set_function_attribute(vm: VirtualMachine, frame: Frame, instr: VMInstructi
             freevars = func_target.code_obj.co_freevars
             for name, cell in zip(freevars, attr_value):
                 func_target.closure[name] = cell
+
+    frame.push(func_target)
 
 
 @VirtualMachine.register("PUSH_NULL")
